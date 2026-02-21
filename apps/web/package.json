@@ -1,0 +1,22 @@
+{
+  "name": "@autoagent/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "pnpm run build && electron dist/main.js",
+    "start": "electron dist/main.js",
+    "lint": "node -e \"console.log('lint: pending')\"",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "electron": "^37.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.1",
+    "typescript": "^5.9.2"
+  }
+}

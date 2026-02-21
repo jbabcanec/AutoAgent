@@ -1,0 +1,15 @@
+{
+  "name": "autoagent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source provider-agnostic developer agent platform",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@9.12.1",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r dev",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  }
+}

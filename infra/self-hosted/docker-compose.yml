@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  control-plane:
+    image: node:22
+    working_dir: /workspace/apps/control-plane
+    command: ["node", "src/index.ts"]
+    volumes:
+      - ../../:/workspace
+    environment:
+      - AUTOAGENT_MODE=self-hosted
+      - AUTOAGENT_REQUIRE_APPROVAL=true
+    ports:
+      - "8080:8080"
+
+  runner:
+    image: node:22
+    working_dir: /workspace/apps/runner
+    command: ["node", "src/index.ts"]
+    volumes:
+      - ../../:/workspace
+    environment:
+      - AUTOAGENT_SANDBOX_MODE=container
+      - AUTOAGENT_REQUIRE_APPROVAL=true
+
+  web:
+    image: node:22
+    working_dir: /workspace/apps/web
+    command: ["node", "src/index.ts"]
+    volumes:
+      - ../../:/workspace
+    environment:
+      - AUTOAGENT_API_URL=http://control-plane:8080
+    ports:
+      - "3000:3000"

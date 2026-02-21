@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoagent-runner
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: autoagent-runner
+  template:
+    metadata:
+      labels:
+        app: autoagent-runner
+    spec:
+      containers:
+        - name: runner
+          image: ghcr.io/autoagent/runner:latest
+          env:
+            - name: AUTOAGENT_SANDBOX_MODE
+              value: hardened-worker
+            - name: AUTOAGENT_REQUIRE_APPROVAL
+              value: "true"
