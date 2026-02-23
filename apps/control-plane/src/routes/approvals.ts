@@ -15,14 +15,18 @@ export function handleApprovalsRoute(
     if (typeof payload.runId !== "string" || typeof payload.reason !== "string") {
       return { status: 400, body: { error: "runId and reason are required" } };
     }
+    const toolName = typeof payload.toolName === "string" ? payload.toolName : undefined;
+    const toolInput = isRecord(payload.toolInput) ? payload.toolInput : undefined;
+    const expiresAt = typeof payload.expiresAt === "string" ? payload.expiresAt : undefined;
+    const contextHash = typeof payload.contextHash === "string" ? payload.contextHash : undefined;
     const approval = ctx.approvals.create({
       runId: payload.runId,
       reason: payload.reason,
       scope: payload.scope === "tool" ? "tool" : "run",
-      toolName: typeof payload.toolName === "string" ? payload.toolName : undefined,
-      toolInput: isRecord(payload.toolInput) ? payload.toolInput : undefined,
-      expiresAt: typeof payload.expiresAt === "string" ? payload.expiresAt : undefined,
-      contextHash: typeof payload.contextHash === "string" ? payload.contextHash : undefined
+      ...(toolName !== undefined ? { toolName } : {}),
+      ...(toolInput !== undefined ? { toolInput } : {}),
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
+      ...(contextHash !== undefined ? { contextHash } : {})
     });
     ctx.traces.append(approval.runId, "approval.requested", {
       approvalId: approval.id,

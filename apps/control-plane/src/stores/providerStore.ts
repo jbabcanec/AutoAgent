@@ -63,12 +63,13 @@ function mapRow(row: {
   default_model: string | null;
   api_key_stored: number;
 }): ProviderItem {
-  return {
+  const result: ProviderItem = {
     id: row.id,
     displayName: row.display_name,
     kind: row.kind,
     baseUrl: row.base_url,
-    defaultModel: row.default_model ?? undefined,
     apiKeyStored: row.api_key_stored === 1
   };
+  if (row.default_model !== null) result.defaultModel = row.default_model;
+  return result;
 }

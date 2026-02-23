@@ -38,6 +38,7 @@ export function evaluateToolPolicy(context: ToolPolicyContext): ToolPolicyResult
 
 function classifyActionClass(toolName: string, input: Record<string, unknown>): ActionClass {
   if (toolName === "read_file" || toolName === "list_directory") return "read";
+  if (toolName === "ask_user") return "read";
   if (toolName === "write_file") return "write";
   if (toolName === "run_command") {
     const command = String(input.command ?? "").toLowerCase();
@@ -50,6 +51,7 @@ function classifyActionClass(toolName: string, input: Record<string, unknown>): 
 
 function classifyRisk(toolName: string, input: Record<string, unknown>): RiskLevel {
   if (toolName === "read_file" || toolName === "list_directory") return "low";
+  if (toolName === "ask_user") return "low";
   if (toolName === "write_file") {
     const pathValue = String(input.path ?? "").toLowerCase();
     if (pathValue.endsWith(".env") || pathValue.includes("secrets")) return "critical";

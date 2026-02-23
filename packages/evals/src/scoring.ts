@@ -36,3 +36,33 @@ export function scoreRun(input: ScoringInput): BenchmarkResult {
     notes
   };
 }
+
+export interface PromotionGateInput {
+  aggregateScore: number;
+  safetyViolations: number;
+  verificationPassRate: number;
+  minAggregateScore: number;
+  maxSafetyViolations: number;
+  minVerificationPassRate: number;
+}
+
+export interface PromotionGateResult {
+  promoted: boolean;
+  reasons: string[];
+}
+
+export function evaluatePromotionGate(input: PromotionGateInput): PromotionGateResult {
+  const reasons: string[] = [];
+  if (input.aggregateScore < input.minAggregateScore) {
+    reasons.push(`Aggregate score ${input.aggregateScore.toFixed(3)} is below ${input.minAggregateScore.toFixed(3)}.`);
+  }
+  if (input.safetyViolations > input.maxSafetyViolations) {
+    reasons.push(`Safety violations ${input.safetyViolations} exceeds max ${input.maxSafetyViolations}.`);
+  }
+  if (input.verificationPassRate < input.minVerificationPassRate) {
+    reasons.push(
+      `Verification pass rate ${input.verificationPassRate.toFixed(3)} is below ${input.minVerificationPassRate.toFixed(3)}.`
+    );
+  }
+  return { promoted: reasons.length === 0, reasons };
+}

@@ -10,25 +10,43 @@ export type RunLifecycleState =
   | "completed"
   | "failed";
 
+export interface PlanStep {
+  stepNumber: number;
+  description: string;
+  status: "pending" | "in_progress" | "completed" | "failed" | "skipped";
+}
+
+export interface FollowUpAction {
+  id: string;
+  label: string;
+  description: string;
+  objectiveHint?: string;
+}
+
 export interface RunStatusEvent {
   runId: string;
   state: RunLifecycleState;
   message: string;
   timestamp: string;
   detail?: string;
-  type?: "info" | "tool_call" | "tool_result" | "llm_text" | "error";
+  type?: "info" | "tool_call" | "tool_result" | "llm_text" | "error" | "plan" | "reflection" | "ask_user" | "follow_up";
   turn?: number;
   model?: string;
   tokenUsage?: { input: number; output: number };
   duration?: number;
   toolName?: string;
   toolInput?: string;
+  planSteps?: PlanStep[];
+  reflectionNotes?: string[];
+  promptId?: string;
+  followUpActions?: FollowUpAction[];
 }
 
 export interface StartRunInput {
   providerId: string;
   directory: string;
   objective: string;
+  threadId?: string;
 }
 
 export interface StartRunResult {
@@ -64,6 +82,11 @@ export interface DesktopApi {
     tokenTotal: number;
     actionCount: number;
     retries: number;
+    transientRetries: number;
+    providerRetries: number;
+    toolRetries: number;
+    policyRetries: number;
+    unknownRetries: number;
     approvalsRequested: number;
     approvalsResolved: number;
     providerLatencyMs: number;
@@ -73,6 +96,10 @@ export interface DesktopApi {
     safetyViolations: number;
     validationFailures: number;
     egressDenied: number;
+    verificationPassed: number;
+    verificationFailed: number;
+    planningEvents: number;
+    reflectionEvents: number;
   }>;
   deleteRun(runId: string): Promise<{ deleted: boolean }>;
   startRun(input: StartRunInput): Promise<StartRunResult>;
@@ -86,6 +113,19 @@ export interface DesktopApi {
   runQuickLaunch(input: StartRunInput): Promise<StartRunResult>;
   runChatTrial(input: { providerId: string; prompt: string }): Promise<{ text: string }>;
   runRepoTrial(input: { providerId: string; directory: string; objective: string }): Promise<{ text: string }>;
+  fetchThreadByRun(runId: string): Promise<{ threadId: string; runId: string } | null>;
+  fetchThreadMessages(threadId: string): Promise<Array<{ role: string; content: string; turnNumber: number }>>;
+  fetchUserPrompts(runId: string): Promise<Array<{
+    promptId: string;
+    runId: string;
+    turnNumber: number;
+    promptText: string;
+    status: "pending" | "answered" | "expired" | "cancelled";
+    responseText?: string;
+  }>>;
+  answerUserPrompt(input: { promptId: string; responseText: string }): Promise<{ ok: boolean }>;
+  getFollowUpSuggestions(input: { runId: string }): Promise<FollowUpAction[]>;
+  executeFollowUp(input: { runId: string; objective: string }): Promise<StartRunResult>;
   dialogSelectDirectory(): Promise<string | null>;
   fsReadDirectory(dirPath: string): Promise<DirectoryEntry[]>;
   fsReadFile(filePath: string): Promise<{ content: string; truncated: boolean }>;
@@ -112,6 +152,12 @@ export const IPC_CHANNELS = {
   runQuickLaunch: "run.quickLaunch",
   runChatTrial: "run.trial.chat",
   runRepoTrial: "run.trial.repo",
+  fetchThreadByRun: "thread.fetch.byRun",
+  fetchThreadMessages: "thread.fetch.messages",
+  fetchUserPrompts: "prompt.fetch.byRun",
+  answerUserPrompt: "prompt.answer",
+  getFollowUpSuggestions: "run.followUp.suggestions",
+  executeFollowUp: "run.followUp.execute",
   runStatus: "run.status",
   approvalResolve: "approval.resolve",
   keychainStoreApiKey: "keychain.store.apiKey",

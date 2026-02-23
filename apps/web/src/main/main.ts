@@ -3,7 +3,14 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { IPC_CHANNELS, type RunLifecycleState, type RunStatusEvent, type StartRunInput } from "../shared/ipc.js";
+import {
+  IPC_CHANNELS,
+  type FollowUpAction,
+  type PlanStep,
+  type RunLifecycleState,
+  type RunStatusEvent,
+  type StartRunInput
+} from "../shared/ipc.js";
 import { RunLifecycleMachine } from "./runLifecycle.js";
 import { deleteApiKey, getApiKey, hasApiKey, storeApiKey } from "./keychain.js";
 import { ANTHROPIC_TOOLS, OPENAI_TOOLS, executeTool } from "./agentTools.js";
@@ -12,7 +19,15 @@ import { evaluateToolPolicy } from "./executionPolicy.js";
 import { inspectCommand } from "./commandValidator.js";
 import { evaluateEgressPolicy } from "./egressPolicy.js";
 import { clearExecutionState, loadExecutionState, saveExecutionState, type PersistedExecutionState } from "./executionState.js";
-import { guardCircuit, recordCircuitFailure, recordCircuitSuccess, withRetry, type CircuitState } from "./executionOrchestrator.js";
+import {
+  classifyRetryError,
+  guardCircuit,
+  recordCircuitFailure,
+  recordCircuitSuccess,
+  retryPolicyFor,
+  withRetry,
+  type CircuitState
+} from "./executionOrchestrator.js";
 import { scoreExecution } from "./evalFeedback.js";
 import { validateToolOutcome } from "./executionValidator.js";
 
@@ -64,7 +79,23 @@ function emitRunStatus(
   runId: string,
   state: RunLifecycleState,
   message: string,
-  opts?: Partial<Pick<RunStatusEvent, "detail" | "type" | "turn" | "model" | "tokenUsage" | "duration" | "toolName" | "toolInput">>
+  opts?: Partial<
+    Pick<
+      RunStatusEvent,
+      | "detail"
+      | "type"
+      | "turn"
+      | "model"
+      | "tokenUsage"
+      | "duration"
+      | "toolName"
+      | "toolInput"
+      | "planSteps"
+      | "reflectionNotes"
+      | "promptId"
+      | "followUpActions"
+    >
+  >
 ): void {
   const event: RunStatusEvent = {
     runId,
@@ -81,6 +112,10 @@ function emitRunStatus(
     if (opts.duration !== undefined) event.duration = opts.duration;
     if (opts.toolName !== undefined) event.toolName = opts.toolName;
     if (opts.toolInput !== undefined) event.toolInput = opts.toolInput;
+    if (opts.planSteps !== undefined) event.planSteps = opts.planSteps;
+    if (opts.reflectionNotes !== undefined) event.reflectionNotes = opts.reflectionNotes;
+    if (opts.promptId !== undefined) event.promptId = opts.promptId;
+    if (opts.followUpActions !== undefined) event.followUpActions = opts.followUpActions;
   }
   mainWindow?.webContents.send(IPC_CHANNELS.runStatus, event);
 }
@@ -409,9 +444,11 @@ async function executeRun(
     const routingMode = settingsData.routingMode ?? "balanced";
     const modelName = await selectModelByRouting(provider.defaultModel ?? "gpt-4o", routingMode, provider.id);
     const circuit = getCircuit(provider.id);
+    const threadId = await ensureRunThread(run.runId, input.threadId);
     await saveExecutionState(requestJson, run.runId, {
       runId: run.runId,
       phase: "running",
+      phaseMarker: "planning",
       turn: resumeFrom?.turn ?? 0,
       input,
       stats: resumeFrom?.stats ?? { actionCount: 0, totalInputTokens: 0, totalOutputTokens: 0, retries: 0 }
@@ -456,7 +493,35 @@ ${context.tree}
 
 ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## This is an empty or new directory."}`;
 
-    const messages: AgentMessage[] = [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }];
+    const historicalMessages = await loadThreadMessages(threadId);
+    const historyTail = historicalMessages.slice(-8).map((msg): AgentMessage => {
+      if (msg.role === "assistant") return { role: "assistant", content: msg.content };
+      if (msg.role === "system") return { role: "system", content: msg.content };
+      return { role: "user", content: msg.content };
+    });
+    const messages: AgentMessage[] = [{ role: "system", content: systemPrompt }, ...historyTail, { role: "user", content: userPrompt }];
+
+    // Pre-execution planning turn (no tools) to enforce think-then-act behavior.
+    const planningText = await runPlanningTurn({
+      providerKind: provider.kind,
+      baseUrl: provider.baseUrl,
+      apiKey,
+      model: modelName,
+      objective: input.objective,
+      contextTree: context.tree,
+      maxTokens
+    });
+    const planSteps = parsePlanSteps(planningText);
+    emitRunStatus(run.runId, "executing", "Execution plan generated.", {
+      type: "plan",
+      planSteps,
+      detail: planningText
+    });
+    await appendTrace(run.runId, "execution.plan", {
+      planText: planningText,
+      planSteps
+    });
+    await appendThreadMessage(threadId, "assistant", planningText, 0, { type: "plan" });
 
     await appendTrace(run.runId, "llm.request", {
       model: modelName,
@@ -468,6 +533,8 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
 
     // 4. Agentic loop with turn tracking
     const allTextResponses: string[] = [];
+    await appendThreadMessage(threadId, "system", systemPrompt, 0);
+    await appendThreadMessage(threadId, "user", userPrompt, 0);
     let actionCount = resumeFrom?.stats.actionCount ?? 0;
     let totalInputTokens = resumeFrom?.stats.totalInputTokens ?? 0;
     let totalOutputTokens = resumeFrom?.stats.totalOutputTokens ?? 0;
@@ -492,7 +559,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
             recordCircuitSuccess(circuit);
             return value;
           },
-          { attempts: 3, baseDelayMs: 400 },
+          retryPolicyFor("transient", "llm"),
           async (attempt, error) => {
             retryCount += 1;
             recordCircuitFailure(circuit, Date.now());
@@ -500,7 +567,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
               attempt,
               stage: "llm.anthropic",
               error,
-              errorClass: classifyError(error)
+              errorClass: classifyRetryError(error)
             });
           }
         );
@@ -534,12 +601,34 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
         for (const block of contentBlocks) {
           if (block.type === "text" && block.text) {
             allTextResponses.push(block.text);
+            await appendThreadMessage(threadId, "assistant", block.text, turnNum);
             emitRunStatus(run.runId, "executing", block.text.slice(0, 500), { type: "llm_text", turn: turnNum, detail: block.text });
             await appendTrace(run.runId, "llm.text", { text: block.text, turn: turnNum });
           }
           if (block.type === "tool_use" && block.name && block.id) {
             const toolName = block.name;
             const toolInput = (block.input ?? {}) as Record<string, unknown>;
+            if (toolName === "ask_user") {
+              const question = String(toolInput.question ?? "").trim();
+              const prompt = await createUserPrompt({
+                runId: run.runId,
+                threadId,
+                turnNumber: turnNum,
+                promptText: question || "Please clarify the requirement.",
+                context: isRecord(toolInput) ? toolInput : {}
+              });
+              emitRunStatus(run.runId, "executing", prompt.promptText, {
+                type: "ask_user",
+                turn: turnNum,
+                promptId: prompt.promptId
+              });
+              const answer = await waitForPromptAnswer(prompt.promptId, controller.signal);
+              const resultText = `Operator answer: ${answer}`;
+              toolResults.push({ type: "tool_result", id: block.id, text: resultText } as unknown as AnthropicContentBlock);
+              await appendThreadMessage(threadId, "user", `Q: ${prompt.promptText}\nA: ${answer}`, turnNum, { type: "ask_user_answer" });
+              await appendTrace(run.runId, "ask_user.answered", { promptId: prompt.promptId, turn: turnNum });
+              continue;
+            }
             const toolInputSummary = describeToolInput(toolName, toolInput);
             emitRunStatus(run.runId, "executing", describeToolCall(toolName, toolInput), {
               type: "tool_call", turn: turnNum, toolName, toolInput: toolInputSummary
@@ -566,7 +655,10 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                 const egress = evaluateEgressPolicy({
                   hosts: inspection.externalHosts,
                   mode: settingsData.egressPolicyMode ?? "audit",
-                  allowHosts: settingsData.egressAllowHosts ?? []
+                  allowHosts: settingsData.egressAllowHosts ?? [],
+                  exceptionHosts: Array.isArray(toolInput.egressExceptionHosts)
+                    ? toolInput.egressExceptionHosts.filter((entry): entry is string => typeof entry === "string")
+                    : []
                 });
                 await appendTrace(run.runId, "execution.egress_decision", {
                   turn: turnNum,
@@ -603,7 +695,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
               }
               result = await withRetry(
                 async () => executeTool(toolName, toolInput, input.directory),
-                { attempts: 2, baseDelayMs: 250 },
+                retryPolicyFor("tool", "tool"),
                 async (attempt, error) => {
                   retryCount += 1;
                   await appendTrace(run.runId, "execution.retry", {
@@ -611,7 +703,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                     stage: "tool",
                     tool: toolName,
                     error,
-                    errorClass: classifyError(error)
+                    errorClass: classifyRetryError(error)
                   });
                 }
               );
@@ -626,7 +718,21 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                 tool: toolName,
                 ok: validation.ok,
                 severity: validation.severity,
+                confidence: validation.confidence,
+                verificationType: validation.verificationType,
                 checks: validation.checks
+              });
+              await createVerificationArtifact({
+                runId: run.runId,
+                verificationType: validation.verificationType,
+                artifactType: "tool_result",
+                verificationResult: validation.ok ? "pass" : validation.severity === "warn" ? "warning" : "fail",
+                artifactContent: result.slice(0, 4000),
+                checks: validation.checks.map((check) => ({
+                  check,
+                  passed: validation.ok,
+                  severity: validation.severity === "error" ? "error" : validation.severity === "warn" ? "warn" : "info"
+                }))
               });
               if (!validation.ok) {
                 validationFailures += 1;
@@ -658,6 +764,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
           const checkpointState: PersistedExecutionState = {
             runId: run.runId,
             phase: "checkpointed",
+            phaseMarker: "executing",
             turn: turnNum,
             input,
             stats: {
@@ -672,7 +779,8 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
               at: new Date().toISOString(),
               reason: "anthropic.tool_result",
               messageCount: messages.length
-            }
+            },
+            replayBoundary: createReplayBoundary(run.runId, turnNum, "anthropic.tool_result", messages.length)
           };
           await saveExecutionState(requestJson, run.runId, checkpointState);
           await appendTrace(run.runId, "execution.checkpoint", { turn: turnNum, reason: "anthropic.tool_result" });
@@ -691,7 +799,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
             recordCircuitSuccess(circuit);
             return value;
           },
-          { attempts: 3, baseDelayMs: 400 },
+          retryPolicyFor("transient", "llm"),
           async (attempt, error) => {
             retryCount += 1;
             recordCircuitFailure(circuit, Date.now());
@@ -699,7 +807,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
               attempt,
               stage: "llm.openai",
               error,
-              errorClass: classifyError(error)
+              errorClass: classifyRetryError(error)
             });
           }
         );
@@ -731,6 +839,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
 
         if (assistantMessage?.content) {
           allTextResponses.push(assistantMessage.content);
+          await appendThreadMessage(threadId, "assistant", assistantMessage.content, turnNum);
           emitRunStatus(run.runId, "executing", assistantMessage.content.slice(0, 500), {
             type: "llm_text", turn: turnNum, detail: assistantMessage.content
           });
@@ -751,6 +860,28 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
             try {
               toolInput = JSON.parse(tc.function.arguments) as Record<string, unknown>;
             } catch { /* malformed args */ }
+
+            if (tc.function.name === "ask_user") {
+              const question = String(toolInput.question ?? "").trim();
+              const prompt = await createUserPrompt({
+                runId: run.runId,
+                threadId,
+                turnNumber: turnNum,
+                promptText: question || "Please clarify the requirement.",
+                context: isRecord(toolInput) ? toolInput : {}
+              });
+              emitRunStatus(run.runId, "executing", prompt.promptText, {
+                type: "ask_user",
+                turn: turnNum,
+                promptId: prompt.promptId
+              });
+              const answer = await waitForPromptAnswer(prompt.promptId, controller.signal);
+              const resultText = `Operator answer: ${answer}`;
+              messages.push({ role: "tool", tool_call_id: tc.id, content: resultText });
+              await appendThreadMessage(threadId, "user", `Q: ${prompt.promptText}\nA: ${answer}`, turnNum, { type: "ask_user_answer" });
+              await appendTrace(run.runId, "ask_user.answered", { promptId: prompt.promptId, turn: turnNum });
+              continue;
+            }
 
             const toolInputSummary = describeToolInput(tc.function.name, toolInput);
             emitRunStatus(run.runId, "executing", describeToolCall(tc.function.name, toolInput), {
@@ -778,7 +909,10 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                 const egress = evaluateEgressPolicy({
                   hosts: inspection.externalHosts,
                   mode: settingsData.egressPolicyMode ?? "audit",
-                  allowHosts: settingsData.egressAllowHosts ?? []
+                  allowHosts: settingsData.egressAllowHosts ?? [],
+                  exceptionHosts: Array.isArray(toolInput.egressExceptionHosts)
+                    ? toolInput.egressExceptionHosts.filter((entry): entry is string => typeof entry === "string")
+                    : []
                 });
                 await appendTrace(run.runId, "execution.egress_decision", {
                   turn: turnNum,
@@ -829,7 +963,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
               }
               result = await withRetry(
                 async () => executeTool(tc.function.name, toolInput, input.directory),
-                { attempts: 2, baseDelayMs: 250 },
+                retryPolicyFor("tool", "tool"),
                 async (attempt, error) => {
                   retryCount += 1;
                   await appendTrace(run.runId, "execution.retry", {
@@ -837,7 +971,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                     stage: "tool",
                     tool: tc.function.name,
                     error,
-                    errorClass: classifyError(error)
+                    errorClass: classifyRetryError(error)
                   });
                 }
               );
@@ -852,7 +986,21 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                 tool: tc.function.name,
                 ok: validation.ok,
                 severity: validation.severity,
+                confidence: validation.confidence,
+                verificationType: validation.verificationType,
                 checks: validation.checks
+              });
+              await createVerificationArtifact({
+                runId: run.runId,
+                verificationType: validation.verificationType,
+                artifactType: "tool_result",
+                verificationResult: validation.ok ? "pass" : validation.severity === "warn" ? "warning" : "fail",
+                artifactContent: result.slice(0, 4000),
+                checks: validation.checks.map((check) => ({
+                  check,
+                  passed: validation.ok,
+                  severity: validation.severity === "error" ? "error" : validation.severity === "warn" ? "warn" : "info"
+                }))
               });
               if (!validation.ok) {
                 validationFailures += 1;
@@ -878,6 +1026,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
           const checkpointState: PersistedExecutionState = {
             runId: run.runId,
             phase: "checkpointed",
+            phaseMarker: "executing",
             turn: turnNum,
             input,
             stats: {
@@ -892,7 +1041,8 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
               at: new Date().toISOString(),
               reason: "openai.tool_result",
               messageCount: messages.length
-            }
+            },
+            replayBoundary: createReplayBoundary(run.runId, turnNum, "openai.tool_result", messages.length)
           };
           await saveExecutionState(requestJson, run.runId, checkpointState);
           await appendTrace(run.runId, "execution.checkpoint", { turn: turnNum, reason: "openai.tool_result" });
@@ -905,9 +1055,31 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
       }
     }
 
-    // 5. Finalize
+    // 5. Reflection turn before finalize
+    const draftResponse = allTextResponses.join("\n\n");
+    const reflectionText = await runReflectionTurn({
+      providerKind: provider.kind,
+      baseUrl: provider.baseUrl,
+      apiKey,
+      model: modelName,
+      objective: input.objective,
+      draftResponse,
+      maxTokens: Math.min(1200, maxTokens)
+    });
+    const reflectionNotes = parseReflectionNotes(reflectionText);
+    emitRunStatus(run.runId, "executing", "Reflection completed.", {
+      type: "reflection",
+      detail: reflectionText,
+      reflectionNotes
+    });
+    await appendTrace(run.runId, "execution.reflection", { reflectionText, reflectionNotes });
+    await appendThreadMessage(threadId, "assistant", reflectionText, MAX_AGENT_TURNS + 1, { type: "reflection" });
+
+    // 6. Finalize
     const totalDuration = Date.now() - runStartTime;
-    const finalResponse = allTextResponses.join("\n\n");
+    const finalResponse = [draftResponse, reflectionNotes.length > 0 ? `\n\nReflection notes:\n- ${reflectionNotes.join("\n- ")}` : ""]
+      .join("")
+      .trim();
     const estimatedCostUsd = Number((((totalInputTokens / 1_000_000) * 0.2) + ((totalOutputTokens / 1_000_000) * 0.8)).toFixed(6));
     const expectedFragments = input.objective.trim() ? [input.objective.trim().split(/\s+/)[0] as string] : [];
     const evaluation = scoreExecution({
@@ -936,6 +1108,17 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
       candidateScore: evaluation.aggregateScore,
       improved: evaluation.aggregateScore > baseline
     });
+    const verificationPassRate = Math.max(0, actionCount - validationFailures) / Math.max(1, actionCount);
+    await recordPromotionEvaluation({
+      runId: run.runId,
+      criterionId: "default-v1",
+      aggregateScore: evaluation.aggregateScore,
+      safetyViolations,
+      verificationPassRate,
+      latencyMs: totalDuration,
+      estimatedCostUsd,
+      reason: `aggregate=${evaluation.aggregateScore.toFixed(3)} safety=${safetyViolations} verificationPassRate=${verificationPassRate.toFixed(3)}`
+    });
     await recordModelPerformance({
       providerId: provider.id,
       model: modelName,
@@ -963,9 +1146,14 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
       tokenUsage: { input: totalInputTokens, output: totalOutputTokens },
       duration: totalDuration
     });
+    emitRunStatus(run.runId, "completed", "Suggested next steps ready.", {
+      type: "follow_up",
+      followUpActions: buildFollowUpActions(input.objective, reflectionNotes)
+    });
     await saveExecutionState(requestJson, run.runId, {
       runId: run.runId,
       phase: "completed",
+      phaseMarker: "finalizing",
       turn: MAX_AGENT_TURNS,
       input,
       stats: {
@@ -993,6 +1181,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
     await saveExecutionState(requestJson, run.runId, {
       runId: run.runId,
       phase: message.includes("aborted") ? "aborted" : "failed",
+      phaseMarker: "finalizing",
       turn: 0,
       input,
       stats: {
@@ -1090,15 +1279,6 @@ function rankModel(
   return success + quality - latencyPenalty * 0.6 - costPenalty * 0.6;
 }
 
-function classifyError(errorMessage: string): "transient" | "policy" | "tool" | "provider" | "unknown" {
-  const normalized = errorMessage.toLowerCase();
-  if (normalized.includes("denied by policy") || normalized.includes("egress")) return "policy";
-  if (normalized.includes("api error") || normalized.includes("provider circuit")) return "provider";
-  if (normalized.includes("exit ") || normalized.includes("tool")) return "tool";
-  if (normalized.includes("timeout") || normalized.includes("network") || normalized.includes("temporarily")) return "transient";
-  return "unknown";
-}
-
 function hashApprovalContext(
   runId: string,
   turn: number,
@@ -1176,11 +1356,15 @@ ipcMain.handle(IPC_CHANNELS.runResume, async (_event, input: { runId: string }) 
   if (!persisted) {
     throw new Error("No persisted execution state available for resume.");
   }
+  assertDeterministicResume(persisted, "resume");
   const stateInput = (persisted.input ?? {}) as Partial<StartRunInput>;
   const runInput: StartRunInput = {
     providerId: typeof stateInput.providerId === "string" ? stateInput.providerId : "openai-default",
     directory: typeof stateInput.directory === "string" ? stateInput.directory : process.cwd(),
-    objective: typeof stateInput.objective === "string" ? stateInput.objective : "Resume previous run"
+    objective: typeof stateInput.objective === "string" ? stateInput.objective : "Resume previous run",
+    ...(typeof (stateInput as { threadId?: unknown }).threadId === "string"
+      ? { threadId: (stateInput as { threadId?: string }).threadId as string }
+      : {})
   };
   runInputs.set(run.runId, runInput);
   emitRunStatus(run.runId, lifecycle.transition("executing"), "Resuming from checkpoint...", { type: "info" });
@@ -1192,11 +1376,17 @@ ipcMain.handle(IPC_CHANNELS.runRetry, async (_event, input: { runId: string }) =
   await ensureNoPendingApprovals(run.runId);
   const cachedInput = runInputs.get(input.runId);
   const persisted = await loadExecutionState(requestJson, input.runId);
+  if (persisted) {
+    assertDeterministicResume(persisted, "retry");
+  }
   const stateInput = (persisted?.input ?? {}) as Partial<StartRunInput>;
   const runInput: StartRunInput = cachedInput ?? {
     providerId: typeof stateInput.providerId === "string" ? stateInput.providerId : "openai-default",
     directory: typeof stateInput.directory === "string" ? stateInput.directory : process.cwd(),
-    objective: typeof stateInput.objective === "string" ? stateInput.objective : "Retry previous run"
+    objective: typeof stateInput.objective === "string" ? stateInput.objective : "Retry previous run",
+    ...(typeof (stateInput as { threadId?: unknown }).threadId === "string"
+      ? { threadId: (stateInput as { threadId?: string }).threadId as string }
+      : {})
   };
   emitRunStatus(run.runId, lifecycle.transition("executing"), "Retrying run...", { type: "info" });
   return executeRun(runInput, run);
@@ -1275,6 +1465,51 @@ ipcMain.handle(IPC_CHANNELS.runRepoTrial, async (_event, input: { providerId: st
     text: `Repo trial initialized for ${input.directory}. Use Play to run guarded execution for objective: ${input.objective}`
   };
 });
+ipcMain.handle(IPC_CHANNELS.fetchThreadByRun, async (_event, runId: string) =>
+  requestJson(`/api/threads/by-run/${encodeURIComponent(runId)}`)
+);
+ipcMain.handle(IPC_CHANNELS.fetchThreadMessages, async (_event, threadId: string) =>
+  requestJson(`/api/threads/${encodeURIComponent(threadId)}/messages`)
+);
+ipcMain.handle(IPC_CHANNELS.fetchUserPrompts, async (_event, runId: string) =>
+  requestJson(`/api/prompts/by-run/${encodeURIComponent(runId)}`)
+);
+ipcMain.handle(IPC_CHANNELS.answerUserPrompt, async (_event, input: { promptId: string; responseText: string }) =>
+  requestJson(`/api/prompts/${encodeURIComponent(input.promptId)}/answer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ responseText: input.responseText })
+  }).then(() => ({ ok: true }))
+);
+ipcMain.handle(IPC_CHANNELS.getFollowUpSuggestions, async (_event, input: { runId: string }) => {
+  const run = (await requestJson(`/api/runs/${encodeURIComponent(input.runId)}`)) as { summary?: string };
+  return buildFollowUpActions(run.summary ?? "Continue the run", []);
+});
+ipcMain.handle(IPC_CHANNELS.executeFollowUp, async (_event, input: { runId: string; objective: string }) => {
+  const base = runInputs.get(input.runId);
+  if (!base) {
+    throw new Error("Original run input not found for follow-up.");
+  }
+  const priorThread = (await requestJson(`/api/threads/by-run/${encodeURIComponent(input.runId)}`).catch(() => null)) as
+    | { threadId?: string }
+    | null;
+  lifecycle.reset();
+  emitRunStatus("pending", lifecycle.transition("creating_run"), "Creating follow-up run...");
+  const run = (await requestJson("/api/runs", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ projectId: "local-desktop", objective: input.objective })
+  })) as { runId: string; [key: string]: unknown };
+  const followUpInput: StartRunInput = {
+    providerId: base.providerId,
+    directory: base.directory,
+    objective: input.objective,
+    ...(typeof priorThread?.threadId === "string" ? { threadId: priorThread.threadId } : {})
+  };
+  runInputs.set(run.runId, followUpInput);
+  emitRunStatus(run.runId, lifecycle.transition("approved"), "Follow-up run created.");
+  return executeRun(followUpInput, run);
+});
 
 app.whenReady().then(() => {
   createWindow();
@@ -1351,6 +1586,246 @@ function findKeyFiles(dir: string): string[] {
   return found.slice(0, 15);
 }
 
+async function runPlanningTurn(input: {
+  providerKind: "openai-compatible" | "anthropic-compatible" | "custom";
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  objective: string;
+  contextTree: string;
+  maxTokens: number;
+}): Promise<string> {
+  const planningPrompt = `Create a concise execution plan in 3-6 numbered steps before coding.
+Include explicit verification steps.
+
+Task:
+${input.objective}
+
+Directory map:
+${input.contextTree}`;
+  if (input.providerKind === "anthropic-compatible") {
+    return runAnthropicChat({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      model: input.model,
+      prompt: planningPrompt,
+      systemPrompt: "You are planning a safe, executable coding workflow. Return only the numbered plan.",
+      maxTokens: Math.min(1200, input.maxTokens)
+    });
+  }
+  return runOpenAiCompatibleChat({
+    baseUrl: input.baseUrl,
+    apiKey: input.apiKey,
+    model: input.model,
+    prompt: planningPrompt,
+    systemPrompt: "You are planning a safe, executable coding workflow. Return only the numbered plan.",
+    maxTokens: Math.min(1200, input.maxTokens)
+  });
+}
+
+async function runReflectionTurn(input: {
+  providerKind: "openai-compatible" | "anthropic-compatible" | "custom";
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  objective: string;
+  draftResponse: string;
+  maxTokens: number;
+}): Promise<string> {
+  const reflectionPrompt = `Review this execution result against the objective.
+Return:
+1) what is complete,
+2) what is missing or risky,
+3) the top 3 concrete next actions.
+
+Objective:
+${input.objective}
+
+Execution result:
+${input.draftResponse || "(no textual output)"}`;
+  if (input.providerKind === "anthropic-compatible") {
+    return runAnthropicChat({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      model: input.model,
+      prompt: reflectionPrompt,
+      systemPrompt: "Be critical, concrete, and concise.",
+      maxTokens: Math.min(1200, input.maxTokens)
+    });
+  }
+  return runOpenAiCompatibleChat({
+    baseUrl: input.baseUrl,
+    apiKey: input.apiKey,
+    model: input.model,
+    prompt: reflectionPrompt,
+    systemPrompt: "Be critical, concrete, and concise.",
+    maxTokens: Math.min(1200, input.maxTokens)
+  });
+}
+
+function parsePlanSteps(planText: string): PlanStep[] {
+  const lines = planText
+    .split(/\r?\n/g)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const numbered = lines.filter((line) => /^(\d+[\).]|[-*])\s+/.test(line));
+  const source = numbered.length > 0 ? numbered : lines.slice(0, 6);
+  return source.map((line, index) => ({
+    stepNumber: index + 1,
+    description: line.replace(/^(\d+[\).]|[-*])\s+/, ""),
+    status: "pending"
+  }));
+}
+
+function parseReflectionNotes(reflectionText: string): string[] {
+  return reflectionText
+    .split(/\r?\n/g)
+    .map((line) => line.trim())
+    .filter((line) => /^[-*]\s+/.test(line) || /^\d+[\).]\s+/.test(line))
+    .map((line) => line.replace(/^([-*]|\d+[\).])\s+/, ""))
+    .slice(0, 8);
+}
+
+function buildFollowUpActions(objective: string, reflectionNotes: string[]): FollowUpAction[] {
+  const firstNote = reflectionNotes[0] ?? "Address remaining gaps";
+  return [
+    {
+      id: "followup-fix-gaps",
+      label: "Fix Remaining Gaps",
+      description: "Continue execution to close unfinished items from reflection.",
+      objectiveHint: `${objective}\n\nFollow-up: ${firstNote}`
+    },
+    {
+      id: "followup-add-tests",
+      label: "Add Verification",
+      description: "Add or improve tests/checks for produced code.",
+      objectiveHint: `${objective}\n\nFollow-up: add validation, tests, and checks for robustness.`
+    },
+    {
+      id: "followup-optimize",
+      label: "Optimize Quality/Performance",
+      description: "Refine implementation for quality, latency, and maintainability.",
+      objectiveHint: `${objective}\n\nFollow-up: optimize and refactor for production quality.`
+    }
+  ];
+}
+
+async function ensureRunThread(runId: string, preferredThreadId?: string): Promise<string> {
+  if (preferredThreadId) return preferredThreadId;
+  const existing = (await requestJson(`/api/threads/by-run/${encodeURIComponent(runId)}`).catch(() => null)) as
+    | { threadId?: string }
+    | null;
+  if (existing?.threadId) return existing.threadId;
+  const created = (await requestJson("/api/threads", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ runId, title: "Execution Thread" })
+  })) as { threadId: string };
+  return created.threadId;
+}
+
+async function appendThreadMessage(
+  threadId: string,
+  role: "system" | "user" | "assistant" | "tool",
+  content: string,
+  turnNumber: number,
+  metadata?: Record<string, unknown>
+): Promise<void> {
+  if (!content.trim()) return;
+  await requestJson(`/api/threads/${encodeURIComponent(threadId)}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ role, content: content.slice(0, 20_000), turnNumber, metadata })
+  }).catch(() => undefined);
+}
+
+async function loadThreadMessages(threadId: string): Promise<Array<{ role: string; content: string; turnNumber: number }>> {
+  return (await requestJson(`/api/threads/${encodeURIComponent(threadId)}/messages`).catch(() => [])) as Array<{
+    role: string;
+    content: string;
+    turnNumber: number;
+  }>;
+}
+
+async function createUserPrompt(input: {
+  runId: string;
+  threadId: string;
+  turnNumber: number;
+  promptText: string;
+  context?: Record<string, unknown>;
+}): Promise<{ promptId: string; promptText: string }> {
+  return (await requestJson("/api/prompts", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      runId: input.runId,
+      threadId: input.threadId,
+      turnNumber: input.turnNumber,
+      promptText: input.promptText,
+      context: input.context,
+      expiresAt: new Date(Date.now() + 15 * 60_000).toISOString()
+    })
+  })) as { promptId: string; promptText: string };
+}
+
+async function waitForPromptAnswer(promptId: string, signal: AbortSignal): Promise<string> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 15 * 60_000) {
+    if (signal.aborted) throw new Error("Execution aborted while waiting for user prompt answer.");
+    const direct = (await requestJson(`/api/prompts/${encodeURIComponent(promptId)}`).catch(() => null)) as
+      | { status?: string; responseText?: string; promptText?: string }
+      | null;
+    if (direct?.status === "answered") {
+      return direct.responseText ?? "";
+    }
+    if (direct?.status === "expired" || direct?.status === "cancelled") {
+      throw new Error("User prompt expired or was cancelled.");
+    }
+    await sleep(1000);
+  }
+  throw new Error("Timed out waiting for user prompt answer.");
+}
+
+async function createVerificationArtifact(input: {
+  runId: string;
+  verificationType: string;
+  artifactType: string;
+  artifactContent?: string;
+  verificationResult: "pass" | "fail" | "warning" | "pending";
+  checks?: Array<{ check: string; passed: boolean; severity: "info" | "warn" | "error" }>;
+}): Promise<void> {
+  await requestJson("/api/artifacts", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input)
+  }).catch(() => undefined);
+}
+
+async function recordPromotionEvaluation(input: {
+  runId: string;
+  criterionId: string;
+  aggregateScore: number;
+  safetyViolations: number;
+  verificationPassRate: number;
+  latencyMs?: number;
+  estimatedCostUsd?: number;
+  reason: string;
+}): Promise<void> {
+  await requestJson("/api/promotions/evaluations", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input)
+  }).catch(() => undefined);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function appendTrace(runId: string, eventType: string, payload: Record<string, unknown>): Promise<void> {
   await requestJson(`/api/traces/${encodeURIComponent(runId)}`, {
     method: "POST",
@@ -1364,12 +1839,57 @@ async function ensureNoPendingApprovals(runId: string): Promise<void> {
     runId: string;
     status: string;
     expiresAt?: string;
+    contextHash?: string;
   }>;
   const pending = approvals.filter((approval) => approval.runId === runId && approval.status === "pending");
   const stillValid = pending.filter((approval) => !approval.expiresAt || Date.parse(approval.expiresAt) > Date.now());
   if (stillValid.length > 0) {
     throw new Error("Cannot resume/retry while pending tool approvals exist.");
   }
+  const staleApproved = approvals.some(
+    (approval) =>
+      approval.runId === runId &&
+      approval.status === "approved" &&
+      Boolean(approval.contextHash) &&
+      Boolean(approval.expiresAt) &&
+      Date.parse(String(approval.expiresAt)) <= Date.now()
+  );
+  if (staleApproved) {
+    throw new Error("Cannot resume/retry with stale approved actions; request fresh approval.");
+  }
+}
+
+function assertDeterministicResume(state: PersistedExecutionState, mode: "resume" | "retry"): void {
+  if (state.phase === "completed") {
+    throw new Error(`Cannot ${mode} a completed run.`);
+  }
+  if (state.phase === "aborted") {
+    throw new Error(`Cannot ${mode} an aborted run. Start a new run instead.`);
+  }
+  if (mode === "resume" && state.phase !== "checkpointed") {
+    throw new Error("Resume requires a checkpointed state.");
+  }
+  if (state.phase === "checkpointed" && !state.replayBoundary) {
+    throw new Error("Checkpoint missing replay boundary; refusing non-deterministic replay.");
+  }
+}
+
+function createReplayBoundary(
+  runId: string,
+  turn: number,
+  reason: string,
+  messageCount: number
+): { turn: number; reason: string; contextHash: string; createdAt: string } {
+  const createdAt = new Date().toISOString();
+  const contextHash = createHash("sha256")
+    .update(`${runId}|${turn}|${reason}|${messageCount}`)
+    .digest("hex");
+  return {
+    turn,
+    reason,
+    contextHash,
+    createdAt
+  };
 }
 
 async function runAnthropicChat(input: ChatTrialInput): Promise<string> {

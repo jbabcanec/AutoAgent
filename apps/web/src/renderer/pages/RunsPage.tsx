@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, Clock, Inbox, Trash2 } from "lucide-react";
-import type { RunItem, TraceItem } from "../../lib/types.js";
-import type { RunLifecycleState, RunStatusEvent } from "../../shared/ipc.js";
+import type { RunItem, TraceItem, UserPromptItem } from "../../lib/types.js";
+import type { FollowUpAction, RunLifecycleState, RunStatusEvent } from "../../shared/ipc.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -42,6 +42,10 @@ export function RunsPage({
   onResumeRun,
   onRetryRun,
   onAbortRun,
+  promptsByRun,
+  onAnswerPrompt,
+  followUpActionsByRun,
+  onExecuteFollowUp,
 }: {
   runs: RunItem[];
   traces: TraceItem[];
@@ -53,10 +57,30 @@ export function RunsPage({
   onExpandRun: (runId: string | null) => void;
   onDeleteRun: (runId: string) => void;
   onRefreshTraces: (runId: string) => void;
-  runMetrics: Record<string, { tokenTotal: number; retries: number; estimatedCostUsd: number }>;
+  runMetrics: Record<
+    string,
+    {
+      tokenTotal: number;
+      retries: number;
+      estimatedCostUsd: number;
+      verificationPassed: number;
+      verificationFailed: number;
+      egressDenied: number;
+      transientRetries: number;
+      providerRetries: number;
+      toolRetries: number;
+      policyRetries: number;
+      planningEvents: number;
+      reflectionEvents: number;
+    }
+  >;
   onResumeRun: (runId: string) => void | Promise<void>;
   onRetryRun: (runId: string) => void | Promise<void>;
   onAbortRun: (runId: string) => void | Promise<void>;
+  promptsByRun: Record<string, UserPromptItem[]>;
+  onAnswerPrompt: (promptId: string, responseText: string) => void | Promise<void>;
+  followUpActionsByRun: Record<string, FollowUpAction[]>;
+  onExecuteFollowUp: (runId: string, objective: string) => void | Promise<void>;
 }): React.JSX.Element {
   const isExecuting = runStatus !== "idle" && runStatus !== "completed" && runStatus !== "failed";
 
@@ -113,6 +137,10 @@ export function RunsPage({
             onResume={() => onResumeRun(run.runId)}
             onRetry={() => onRetryRun(run.runId)}
             onAbort={() => onAbortRun(run.runId)}
+            prompts={promptsByRun[run.runId] ?? []}
+            onAnswerPrompt={onAnswerPrompt}
+            followUpActions={followUpActionsByRun[run.runId] ?? []}
+            onExecuteFollowUp={(objective) => onExecuteFollowUp(run.runId, objective)}
           />
         );
       })}
@@ -135,7 +163,11 @@ function TaskCard({
   metrics,
   onResume,
   onRetry,
-  onAbort
+  onAbort,
+  prompts,
+  onAnswerPrompt,
+  followUpActions,
+  onExecuteFollowUp
 }: {
   run: RunItem;
   isExpanded: boolean;
@@ -148,12 +180,32 @@ function TaskCard({
   onToggle: () => void;
   onDelete: () => void;
   onRefreshTraces: () => void;
-  metrics: { tokenTotal: number; retries: number; estimatedCostUsd: number } | undefined;
+  metrics:
+    | {
+        tokenTotal: number;
+        retries: number;
+        estimatedCostUsd: number;
+        verificationPassed: number;
+        verificationFailed: number;
+        egressDenied: number;
+        transientRetries: number;
+        providerRetries: number;
+        toolRetries: number;
+        policyRetries: number;
+        planningEvents: number;
+        reflectionEvents: number;
+      }
+    | undefined;
   onResume: () => void | Promise<void>;
   onRetry: () => void | Promise<void>;
   onAbort: () => void | Promise<void>;
+  prompts: UserPromptItem[];
+  onAnswerPrompt: (promptId: string, responseText: string) => void | Promise<void>;
+  followUpActions: FollowUpAction[];
+  onExecuteFollowUp: (objective: string) => void | Promise<void>;
 }): React.JSX.Element {
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [promptResponses, setPromptResponses] = useState<Record<string, string>>({});
 
   // Build execution steps from traces for completed runs (when no live steps)
   const displaySteps = useMemo((): RunStatusEvent[] => {
@@ -188,6 +240,24 @@ function TaskCard({
       } else if (trace.eventType === "llm.response") {
         base.type = "info";
         base.message = "Execution complete";
+      } else if (trace.eventType === "execution.plan") {
+        base.type = "plan";
+        base.message = "Execution plan generated";
+        base.detail = String(trace.payload.planText ?? "");
+      } else if (trace.eventType === "execution.reflection") {
+        base.type = "reflection";
+        base.message = "Reflection completed";
+        base.detail = String(trace.payload.reflectionText ?? "");
+      } else if (trace.eventType === "execution.retry") {
+        base.type = "error";
+        base.message = `Retry [${String(trace.payload.errorClass ?? "unknown")}] on ${String(trace.payload.stage ?? "unknown-stage")}`;
+      } else if (trace.eventType === "execution.egress_decision") {
+        const decision = String(trace.payload.decision ?? "unknown");
+        base.type = decision === "deny" ? "error" : "info";
+        base.message = `Egress ${decision}: ${String(trace.payload.reason ?? "")}`.slice(0, 260);
+      } else if (trace.eventType === "execution.validation") {
+        base.type = trace.payload.ok === false ? "error" : "info";
+        base.message = `Validation ${trace.payload.ok === false ? "failed" : "passed"}: ${String(trace.payload.tool ?? "tool")}`;
       } else {
         base.type = "info";
         base.message = `${trace.eventType}: ${summarizePayload(trace.payload)}`;
@@ -284,6 +354,13 @@ function TaskCard({
               <div className="mr-auto text-xs text-muted-foreground flex items-center gap-3">
                 <span>Tokens: {metrics?.tokenTotal ?? 0}</span>
                 <span>Retries: {metrics?.retries ?? 0}</span>
+                <span>
+                  Retry classes: t={metrics?.transientRetries ?? 0} p={metrics?.providerRetries ?? 0} tool={metrics?.toolRetries ?? 0} pol=
+                  {metrics?.policyRetries ?? 0}
+                </span>
+                <span>Verify: {metrics?.verificationPassed ?? 0}/{(metrics?.verificationPassed ?? 0) + (metrics?.verificationFailed ?? 0)}</span>
+                <span>Egress denied: {metrics?.egressDenied ?? 0}</span>
+                <span>Plan/reflect: {metrics?.planningEvents ?? 0}/{metrics?.reflectionEvents ?? 0}</span>
                 <span>Cost: ${metrics?.estimatedCostUsd?.toFixed(4) ?? "0.0000"}</span>
               </div>
               <div className="flex items-center gap-2">
@@ -319,6 +396,51 @@ function TaskCard({
                 </Button>
               )}
             </div>
+
+            {prompts.length > 0 && (
+              <div className="px-4 pb-3 space-y-2">
+                <p className="text-xs font-medium text-muted-foreground">Questions waiting for you</p>
+                {prompts.filter((p) => p.status === "pending").map((prompt) => (
+                  <div key={prompt.promptId} className="border rounded-md p-2 space-y-2">
+                    <p className="text-sm">{prompt.promptText}</p>
+                    <div className="flex items-center gap-2">
+                      <input
+                        className="h-8 flex-1 rounded border px-2 text-sm bg-background"
+                        placeholder="Type your answer"
+                        value={promptResponses[prompt.promptId] ?? ""}
+                        onChange={(event) =>
+                          setPromptResponses((prev) => ({ ...prev, [prompt.promptId]: event.target.value }))
+                        }
+                      />
+                      <Button
+                        size="sm"
+                        onClick={() => onAnswerPrompt(prompt.promptId, promptResponses[prompt.promptId] ?? "")}
+                      >
+                        Send
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {!isExecuting && followUpActions.length > 0 && (
+              <div className="px-4 pb-3 space-y-2">
+                <p className="text-xs font-medium text-muted-foreground">Follow-up actions</p>
+                <div className="flex flex-wrap gap-2">
+                  {followUpActions.map((action) => (
+                    <Button
+                      key={action.id}
+                      variant="outline"
+                      size="sm"
+                      onClick={() => onExecuteFollowUp(action.objectiveHint ?? action.description)}
+                    >
+                      {action.label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </CardContent>

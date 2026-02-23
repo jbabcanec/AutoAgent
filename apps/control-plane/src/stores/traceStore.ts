@@ -35,6 +35,11 @@ export class TraceStore {
     tokenTotal: number;
     actionCount: number;
     retries: number;
+    transientRetries: number;
+    providerRetries: number;
+    toolRetries: number;
+    policyRetries: number;
+    unknownRetries: number;
     approvalsRequested: number;
     approvalsResolved: number;
     providerLatencyMs: number;
@@ -44,12 +49,21 @@ export class TraceStore {
     safetyViolations: number;
     validationFailures: number;
     egressDenied: number;
+    verificationPassed: number;
+    verificationFailed: number;
+    planningEvents: number;
+    reflectionEvents: number;
   } {
     const traces = this.listByRun(runId);
     let tokenInput = 0;
     let tokenOutput = 0;
     let actionCount = 0;
     let retries = 0;
+    let transientRetries = 0;
+    let providerRetries = 0;
+    let toolRetries = 0;
+    let policyRetries = 0;
+    let unknownRetries = 0;
     let approvalsRequested = 0;
     let approvalsResolved = 0;
     let providerLatencyMs = 0;
@@ -59,6 +73,10 @@ export class TraceStore {
     let safetyViolations = 0;
     let validationFailures = 0;
     let egressDenied = 0;
+    let verificationPassed = 0;
+    let verificationFailed = 0;
+    let planningEvents = 0;
+    let reflectionEvents = 0;
 
     for (const trace of traces) {
       if (trace.eventType === "llm.response") {
@@ -78,6 +96,12 @@ export class TraceStore {
       }
       if (trace.eventType === "execution.retry") {
         retries += 1;
+        const errorClass = String(trace.payload.errorClass ?? "unknown");
+        if (errorClass === "transient") transientRetries += 1;
+        else if (errorClass === "provider") providerRetries += 1;
+        else if (errorClass === "tool") toolRetries += 1;
+        else if (errorClass === "policy") policyRetries += 1;
+        else unknownRetries += 1;
       }
       if (trace.eventType === "approval.requested") {
         approvalsRequested += 1;
@@ -92,6 +116,12 @@ export class TraceStore {
       if (trace.eventType === "execution.egress_decision" && trace.payload.decision === "deny") {
         egressDenied += 1;
       }
+      if (trace.eventType === "execution.validation") {
+        if (trace.payload.ok === true) verificationPassed += 1;
+        if (trace.payload.ok === false) verificationFailed += 1;
+      }
+      if (trace.eventType === "execution.plan") planningEvents += 1;
+      if (trace.eventType === "execution.reflection") reflectionEvents += 1;
     }
 
     return {
@@ -102,6 +132,11 @@ export class TraceStore {
       tokenTotal: tokenInput + tokenOutput,
       actionCount,
       retries,
+      transientRetries,
+      providerRetries,
+      toolRetries,
+      policyRetries,
+      unknownRetries,
       approvalsRequested,
       approvalsResolved,
       providerLatencyMs,
@@ -110,8 +145,19 @@ export class TraceStore {
       estimatedCostUsd,
       safetyViolations,
       validationFailures,
-      egressDenied
+      egressDenied,
+      verificationPassed,
+      verificationFailed,
+      planningEvents,
+      reflectionEvents
     };
+  }
+
+  public pruneOlderThan(days: number, nowMs = Date.now()): number {
+    if (!Number.isFinite(days) || days <= 0) return 0;
+    const cutoff = new Date(nowMs - days * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.db.prepare("DELETE FROM traces WHERE timestamp < ?").run(cutoff);
+    return result.changes;
   }
 }
 

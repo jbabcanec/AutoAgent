@@ -46,11 +46,39 @@
 4. Trigger `Retry` and confirm execution restarts with new traces.
 5. Confirm retries and token totals appear in task metrics row.
 
+## Execution maturity checks
+
+1. Start a task and expand it in `Tasks`.
+2. Verify a planning event appears before the first tool call.
+3. Trigger a run that asks a clarification question; verify a prompt input appears in the task card.
+4. Submit an answer and confirm execution resumes automatically.
+5. Verify reflection event appears before final completion.
+6. Verify follow-up actions are shown and launching one creates a new run.
+
+## Verification + promotion checks
+
+1. Run a task that executes at least one tool command and file write.
+2. Verify verification traces are present (`execution.validation`) and artifacts are persisted.
+3. Confirm run metrics include verification passed/failed counts.
+4. Confirm promotion status is recorded for the run (promoted/rejected with reason).
+
 ## Data persistence checks
 
 - Restart control-plane process.
 - Verify seeded run/provider/settings data still exists.
 - Create a task via Home and confirm it still appears after restart.
+- Run backup command and verify output file exists:
+  - `pnpm --filter @autoagent/control-plane db:backup`
+- Stop control-plane, run restore command with that file, restart:
+  - `pnpm --filter @autoagent/control-plane db:restore "<backup-file-path>"`
+- Verify dashboard/runs/settings still load after restore.
+
+## Retention cleanup checks
+
+- Update settings retention values through API/UI:
+  - `traceRetentionDays`, `artifactRetentionDays`, `promptRetentionDays`, `cleanupIntervalMinutes`.
+- Restart control-plane and confirm retention cleanup logs print prune counts.
+- Confirm old answered prompts/artifacts/traces are pruned while active runs remain intact.
 
 ## Key security checks
 
@@ -64,6 +92,14 @@
 - Confirm key actions have immediate feedback (save key, start task).
 - Confirm terminology is action-oriented and readable for non-expert users.
 - Confirm blocked tool actions display approval context and resolution in timeline.
+
+## Release gate checklist
+
+- policy-denied tool call
+- denied or expired egress approval
+- retry then success by error class
+- crash + deterministic resume
+- promotion blocked for low verification pass rate
 
 ## Context retrieval checks
 

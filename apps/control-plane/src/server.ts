@@ -1,21 +1,29 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import { handleApprovalsRoute } from "./routes/approvals.js";
+import { handleConversationThreadsRoute } from "./routes/conversationThreads.js";
 import { handleDashboardRoute } from "./routes/dashboard.js";
 import { handleExecutionStateRoute } from "./routes/executionState.js";
 import { handleModelPerformanceRoute } from "./routes/modelPerformance.js";
+import { handlePromotionsRoute } from "./routes/promotions.js";
 import { handleProvidersRoute } from "./routes/providers.js";
 import { handleRunsRoute } from "./routes/runs.js";
 import { handleSettingsRoute } from "./routes/settings.js";
 import { handleTracesRoute } from "./routes/traces.js";
+import { handleUserPromptsRoute } from "./routes/userPrompts.js";
+import { handleVerificationArtifactsRoute } from "./routes/verificationArtifacts.js";
 import type { RouteContext, RouteResult } from "./routes/routeTypes.js";
 import { ApprovalStore } from "./stores/approvalStore.js";
+import { ConversationStore } from "./stores/conversationStore.js";
 import { ExecutionStateStore } from "./stores/executionStateStore.js";
 import { ModelPerformanceStore } from "./stores/modelPerformanceStore.js";
+import { PromotionStore } from "./stores/promotionStore.js";
 import { ProviderStore } from "./stores/providerStore.js";
 import { RunStore } from "./stores/runStore.js";
 import { SettingsStore } from "./stores/settingsStore.js";
 import { TraceStore } from "./stores/traceStore.js";
+import { UserPromptStore } from "./stores/userPromptStore.js";
+import { VerificationArtifactStore } from "./stores/verificationArtifactStore.js";
 
 const ctx: RouteContext = {
   runs: new RunStore(),
@@ -24,8 +32,37 @@ const ctx: RouteContext = {
   traces: new TraceStore(),
   providers: new ProviderStore(),
   settings: new SettingsStore(),
-  modelPerformance: new ModelPerformanceStore()
+  modelPerformance: new ModelPerformanceStore(),
+  conversations: new ConversationStore(),
+  userPrompts: new UserPromptStore(),
+  verificationArtifacts: new VerificationArtifactStore(),
+  promotions: new PromotionStore()
 };
+
+let cleanupTimer: NodeJS.Timeout | undefined;
+
+function runRetentionCleanup(): void {
+  const settings = ctx.settings.get();
+  const tracesPruned = ctx.traces.pruneOlderThan(settings.traceRetentionDays ?? 30);
+  const artifactsPruned = ctx.verificationArtifacts.pruneOlderThan(settings.artifactRetentionDays ?? 30);
+  const promptsPruned = ctx.userPrompts.pruneOlderThan(settings.promptRetentionDays ?? 30);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[retention] traces=${tracesPruned} artifacts=${artifactsPruned} prompts=${promptsPruned} ` +
+      `(days: ${settings.traceRetentionDays ?? 30}/${settings.artifactRetentionDays ?? 30}/${settings.promptRetentionDays ?? 30})`
+  );
+}
+
+function scheduleRetentionCleanup(): void {
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer);
+    cleanupTimer = undefined;
+  }
+  runRetentionCleanup();
+  const settings = ctx.settings.get();
+  const everyMinutes = Math.max(1, settings.cleanupIntervalMinutes ?? 15);
+  cleanupTimer = setInterval(runRetentionCleanup, everyMinutes * 60 * 1000);
+}
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.statusCode = status;
@@ -52,8 +89,12 @@ function route(pathname: string, method: string, body: unknown): RouteResult | u
     handleDashboardRoute(pathname, method, ctx) ??
     handleRunsRoute(pathname, method, body, ctx) ??
     handleApprovalsRoute(pathname, method, body, ctx) ??
+    handleConversationThreadsRoute(pathname, method, body, ctx) ??
     handleExecutionStateRoute(pathname, method, body, ctx) ??
     handleModelPerformanceRoute(pathname, method, body, ctx) ??
+    handleUserPromptsRoute(pathname, method, body, ctx) ??
+    handleVerificationArtifactsRoute(pathname, method, body, ctx) ??
+    handlePromotionsRoute(pathname, method, body, ctx) ??
     handleTracesRoute(pathname, method, body, ctx) ??
     handleSettingsRoute(pathname, method, body, ctx) ??
     handleProvidersRoute(pathname, method, body, ctx)
@@ -75,6 +116,7 @@ const server = createServer(async (req, res) => {
 
 const port = Number(process.env.PORT ?? "8080");
 server.listen(port, () => {
+  scheduleRetentionCleanup();
   // eslint-disable-next-line no-console
   console.log(`Control-plane listening on http://localhost:${port}`);
 });

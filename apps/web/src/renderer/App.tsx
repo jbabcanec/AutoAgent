@@ -1,7 +1,7 @@
 import { Component, type ReactNode, useEffect, useMemo, useState } from "react";
 import { AlertCircle, FolderOpen, Home, ListTodo, Plug, Settings, ShieldCheck } from "lucide-react";
-import type { ApprovalItem, DashboardStats, ProviderItem, RunItem, SettingsItem, TraceItem } from "../lib/types.js";
-import type { RunLifecycleState, RunStatusEvent } from "../shared/ipc.js";
+import type { ApprovalItem, DashboardStats, ProviderItem, RunItem, SettingsItem, TraceItem, UserPromptItem } from "../lib/types.js";
+import type { FollowUpAction, RunLifecycleState, RunStatusEvent } from "../shared/ipc.js";
 import type { SessionStats } from "./components/AgentExecutionView";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -66,7 +66,27 @@ export function App(): React.JSX.Element {
   const [taskNotice, setTaskNotice] = useState<string | undefined>(undefined);
   const [liveSteps, setLiveSteps] = useState<RunStatusEvent[]>([]);
   const [liveResponse, setLiveResponse] = useState<string | null>(null);
-  const [runMetrics, setRunMetrics] = useState<Record<string, { tokenTotal: number; retries: number; estimatedCostUsd: number }>>({});
+  const [runMetrics, setRunMetrics] = useState<
+    Record<
+      string,
+      {
+        tokenTotal: number;
+        retries: number;
+        estimatedCostUsd: number;
+        verificationPassed: number;
+        verificationFailed: number;
+        egressDenied: number;
+        transientRetries: number;
+        providerRetries: number;
+        toolRetries: number;
+        policyRetries: number;
+        planningEvents: number;
+        reflectionEvents: number;
+      }
+    >
+  >({});
+  const [promptsByRun, setPromptsByRun] = useState<Record<string, UserPromptItem[]>>({});
+  const [followUpActionsByRun, setFollowUpActionsByRun] = useState<Record<string, FollowUpAction[]>>({});
 
   const sessionStats = useMemo((): SessionStats => {
     let totalInput = 0;
@@ -98,6 +118,9 @@ export function App(): React.JSX.Element {
       setLiveSteps((prev) => [...prev.slice(-99), event]);
       if (event.state === "completed" && event.detail) {
         setLiveResponse(event.detail);
+      }
+      if (event.type === "follow_up" && event.followUpActions) {
+        setFollowUpActionsByRun((prev) => ({ ...prev, [event.runId]: event.followUpActions ?? [] }));
       }
     });
     void refreshAll();
@@ -141,6 +164,8 @@ export function App(): React.JSX.Element {
     try {
       const traces = await window.autoagent.fetchTraces(runId);
       setState((prev) => ({ ...prev, expandedRunId: runId, traces }));
+      const prompts = await window.autoagent.fetchUserPrompts(runId);
+      setPromptsByRun((prev) => ({ ...prev, [runId]: prompts }));
     } catch (error) {
       setState((prev) => ({
         ...prev,
@@ -155,6 +180,15 @@ export function App(): React.JSX.Element {
         tokenTotal: number;
         retries: number;
         estimatedCostUsd: number;
+        verificationPassed: number;
+        verificationFailed: number;
+        egressDenied: number;
+        transientRetries: number;
+        providerRetries: number;
+        toolRetries: number;
+        policyRetries: number;
+        planningEvents: number;
+        reflectionEvents: number;
       };
       setRunMetrics((prev) => ({ ...prev, [runId]: metrics }));
     } catch {
@@ -172,6 +206,22 @@ export function App(): React.JSX.Element {
     await refreshAll();
   }
 
+  async function answerPrompt(promptId: string, responseText: string): Promise<void> {
+    await window.autoagent.answerUserPrompt({ promptId, responseText });
+    if (state.expandedRunId) {
+      await loadTraces(state.expandedRunId);
+    }
+  }
+
+  async function executeFollowUp(runId: string, objective: string): Promise<void> {
+    const result = await window.autoagent.executeFollowUp({ runId, objective });
+    setState((prev) => ({ ...prev, expandedRunId: result.run.runId, page: "runs" }));
+    await refreshAll();
+    await loadTraces(result.run.runId);
+    const followups = await window.autoagent.getFollowUpSuggestions({ runId: result.run.runId });
+    setFollowUpActionsByRun((prev) => ({ ...prev, [result.run.runId]: followups }));
+  }
+
   async function handlePlay(): Promise<void> {
     setTaskNotice(undefined);
     setLiveSteps([]);
@@ -187,6 +237,8 @@ export function App(): React.JSX.Element {
       setPlayObjective("");
       await refreshAll();
       await loadTraces(result.run.runId);
+      const followups = await window.autoagent.getFollowUpSuggestions({ runId: result.run.runId });
+      setFollowUpActionsByRun((prev) => ({ ...prev, [result.run.runId]: followups }));
     } catch (error) {
       setState((prev) => ({
         ...prev,
@@ -361,6 +413,10 @@ export function App(): React.JSX.Element {
             await loadTraces(runId);
             await loadRunMetrics(runId);
           }}
+          promptsByRun={promptsByRun}
+          onAnswerPrompt={(promptId, responseText) => void answerPrompt(promptId, responseText)}
+          followUpActionsByRun={followUpActionsByRun}
+          onExecuteFollowUp={(runId, objective) => void executeFollowUp(runId, objective)}
         />
       );
     }
@@ -386,7 +442,19 @@ export function App(): React.JSX.Element {
     }
 
     return <ProvidersPage providers={state.providers} onSetActive={setActiveProviderId} activeProviderId={activeProviderId} />;
-  }, [state, playDirectory, playObjective, activeProviderId, setupNotice, taskNotice, liveSteps, liveResponse, sessionStats]);
+  }, [
+    state,
+    playDirectory,
+    playObjective,
+    activeProviderId,
+    setupNotice,
+    taskNotice,
+    liveSteps,
+    liveResponse,
+    sessionStats,
+    promptsByRun,
+    followUpActionsByRun
+  ]);
 
   if (state.loading) {
     return (

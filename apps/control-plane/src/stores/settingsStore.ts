@@ -13,21 +13,30 @@ export class SettingsStore {
     const routingMode = this.getValue("routingMode");
     const egressPolicyMode = this.getValue("egressPolicyMode");
     const egressAllowHostsRaw = this.getValue("egressAllowHosts");
-    return {
+    const traceRetentionDays = this.getValue("traceRetentionDays");
+    const artifactRetentionDays = this.getValue("artifactRetentionDays");
+    const promptRetentionDays = this.getValue("promptRetentionDays");
+    const cleanupIntervalMinutes = this.getValue("cleanupIntervalMinutes");
+    const result: SettingsItem = {
       requireApproval: requireApproval !== "false",
       hasCompletedOnboarding: hasCompletedOnboarding === "true",
       trialTaskCompleted:
         trialTaskCompleted === "chat" || trialTaskCompleted === "repo" || trialTaskCompleted === "both"
           ? trialTaskCompleted
           : "none",
-      onboardingCompletedAt: onboardingCompletedAt || undefined,
-      maxTokens: parseInt(maxTokens, 10) || 4096,
-      routingMode:
-        routingMode === "latency" || routingMode === "quality" || routingMode === "cost" ? routingMode : "balanced",
-      egressPolicyMode:
-        egressPolicyMode === "off" || egressPolicyMode === "enforce" ? egressPolicyMode : "audit",
-      egressAllowHosts: parseJsonArray(egressAllowHostsRaw)
+      maxTokens: parseInt(maxTokens, 10) || 4096
     };
+    if (onboardingCompletedAt) result.onboardingCompletedAt = onboardingCompletedAt;
+    result.routingMode =
+      routingMode === "latency" || routingMode === "quality" || routingMode === "cost" ? routingMode : "balanced";
+    result.egressPolicyMode =
+      egressPolicyMode === "off" || egressPolicyMode === "enforce" ? egressPolicyMode : "audit";
+    result.egressAllowHosts = parseJsonArray(egressAllowHostsRaw);
+    result.traceRetentionDays = parsePositiveInt(traceRetentionDays, 30);
+    result.artifactRetentionDays = parsePositiveInt(artifactRetentionDays, 30);
+    result.promptRetentionDays = parsePositiveInt(promptRetentionDays, 30);
+    result.cleanupIntervalMinutes = parsePositiveInt(cleanupIntervalMinutes, 15);
+    return result;
   }
 
   public update(partial: Partial<SettingsItem>): SettingsItem {
@@ -40,6 +49,10 @@ export class SettingsStore {
     this.setValue("routingMode", next.routingMode ?? "balanced");
     this.setValue("egressPolicyMode", next.egressPolicyMode ?? "audit");
     this.setValue("egressAllowHosts", JSON.stringify(next.egressAllowHosts ?? []));
+    this.setValue("traceRetentionDays", String(next.traceRetentionDays ?? 30));
+    this.setValue("artifactRetentionDays", String(next.artifactRetentionDays ?? 30));
+    this.setValue("promptRetentionDays", String(next.promptRetentionDays ?? 30));
+    this.setValue("cleanupIntervalMinutes", String(next.cleanupIntervalMinutes ?? 15));
     return next;
   }
 
@@ -64,4 +77,9 @@ function parseJsonArray(value: string): string[] {
   } catch {
     return [];
   }
+}
+
+function parsePositiveInt(value: string, fallback: number): number {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }

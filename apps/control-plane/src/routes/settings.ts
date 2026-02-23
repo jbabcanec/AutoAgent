@@ -46,6 +46,18 @@ export function handleSettingsRoute(
     if (Array.isArray(payload.egressAllowHosts)) {
       updates.egressAllowHosts = payload.egressAllowHosts.filter((value): value is string => typeof value === "string");
     }
+    if (typeof payload.traceRetentionDays === "number" && payload.traceRetentionDays > 0) {
+      updates.traceRetentionDays = payload.traceRetentionDays;
+    }
+    if (typeof payload.artifactRetentionDays === "number" && payload.artifactRetentionDays > 0) {
+      updates.artifactRetentionDays = payload.artifactRetentionDays;
+    }
+    if (typeof payload.promptRetentionDays === "number" && payload.promptRetentionDays > 0) {
+      updates.promptRetentionDays = payload.promptRetentionDays;
+    }
+    if (typeof payload.cleanupIntervalMinutes === "number" && payload.cleanupIntervalMinutes > 0) {
+      updates.cleanupIntervalMinutes = payload.cleanupIntervalMinutes;
+    }
     return {
       status: 200,
       body: ctx.settings.update(updates)

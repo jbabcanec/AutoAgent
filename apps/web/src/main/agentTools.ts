@@ -49,6 +49,18 @@ export const ANTHROPIC_TOOLS = [
       },
       required: ["path"]
     }
+  },
+  {
+    name: "ask_user",
+    description: "Ask the human operator a clarifying question and wait for their answer before continuing.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        question: { type: "string" as const, description: "Question for the human operator" },
+        context: { type: "string" as const, description: "Optional short context for why this is needed" }
+      },
+      required: ["question"]
+    }
   }
 ];
 
@@ -118,8 +130,21 @@ function executeReadFile(filePath: string, projectDir: string): string {
 }
 
 function executeRunCommand(command: string, projectDir: string): string {
+  const normalized = command.trim();
+  if (!normalized) {
+    return "exit 1\nCommand cannot be empty.";
+  }
+  if (normalized.includes("\n")) {
+    return "exit 1\nMulti-line commands are blocked.";
+  }
+  if (/[`]|(\$\([^)]+\))|(\|\|)/.test(normalized)) {
+    return "exit 1\nShell expansion and fallback chaining are blocked.";
+  }
+  if (/\b(npm|pnpm|yarn)\s+start\b/i.test(normalized)) {
+    return "exit 1\nLong-running start commands are blocked in guarded execution.";
+  }
   try {
-    const stdout = execSync(command, {
+    const stdout = execSync(normalized, {
       cwd: projectDir,
       timeout: 30_000,
       maxBuffer: 1024 * 1024,

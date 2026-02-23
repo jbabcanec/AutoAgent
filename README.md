@@ -65,3 +65,25 @@ AutoAgent is an open-source, provider-agnostic developer agent platform with gua
 
 - Control-plane data persists in SQLite: `~/.autoagent/control-plane.db`
 - Context/index data persists in SQLite: `~/.autoagent/context.db`
+
+## Backup + restore runbook
+
+- Create a timestamped backup:
+  - `pnpm --filter @autoagent/control-plane db:backup`
+- Create backup to a specific file path:
+  - `pnpm --filter @autoagent/control-plane db:backup "C:/temp/control-plane-backup.db"`
+- Restore from a backup file:
+  - `pnpm --filter @autoagent/control-plane db:restore "C:/temp/control-plane-backup.db"`
+- Recommended restore flow:
+  - stop `@autoagent/control-plane` process,
+  - run restore command,
+  - restart control-plane and verify `GET /api/dashboard/stats`.
+
+## Data retention policy
+
+- Retention settings are in `/api/settings`:
+  - `traceRetentionDays`
+  - `artifactRetentionDays`
+  - `promptRetentionDays`
+  - `cleanupIntervalMinutes`
+- Cleanup executes on control-plane startup and then on a fixed interval.

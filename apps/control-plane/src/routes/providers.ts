@@ -15,12 +15,13 @@ export function handleProvidersRoute(pathname: string, method: string, body: unk
   if (pathname === "/api/providers" && method === "POST") {
     const payload = isRecord(body) ? body : {};
     const id = typeof payload.id === "string" && payload.id.trim() ? payload.id : `provider-${Date.now()}`;
+    const defaultModel = typeof payload.defaultModel === "string" ? payload.defaultModel : undefined;
     const provider = ctx.providers.create({
       id,
       displayName: typeof payload.displayName === "string" ? payload.displayName : "Custom Provider",
       kind: normalizeKind(payload.kind),
       baseUrl: typeof payload.baseUrl === "string" ? payload.baseUrl : "https://api.openai.com/v1",
-      defaultModel: typeof payload.defaultModel === "string" ? payload.defaultModel : undefined,
+      ...(defaultModel !== undefined ? { defaultModel } : {}),
       apiKeyStored: payload.apiKeyStored === true
     });
     return { status: 201, body: provider };

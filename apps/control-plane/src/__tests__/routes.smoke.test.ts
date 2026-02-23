@@ -1,21 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { handleApprovalsRoute } from "../routes/approvals.js";
+import { handleConversationThreadsRoute } from "../routes/conversationThreads.js";
 import { handleDashboardRoute } from "../routes/dashboard.js";
 import { handleExecutionStateRoute } from "../routes/executionState.js";
 import { handleModelPerformanceRoute } from "../routes/modelPerformance.js";
+import { handlePromotionsRoute } from "../routes/promotions.js";
 import { handleProvidersRoute } from "../routes/providers.js";
 import { handleRunsRoute } from "../routes/runs.js";
 import { handleSettingsRoute } from "../routes/settings.js";
 import { handleTracesRoute } from "../routes/traces.js";
+import { handleUserPromptsRoute } from "../routes/userPrompts.js";
+import { handleVerificationArtifactsRoute } from "../routes/verificationArtifacts.js";
 import type { RouteContext } from "../routes/routeTypes.js";
 import { ApprovalStore } from "../stores/approvalStore.js";
+import { ConversationStore } from "../stores/conversationStore.js";
 import { ExecutionStateStore } from "../stores/executionStateStore.js";
 import { ModelPerformanceStore } from "../stores/modelPerformanceStore.js";
+import { PromotionStore } from "../stores/promotionStore.js";
 import { ProviderStore } from "../stores/providerStore.js";
 import { RunStore } from "../stores/runStore.js";
 import { SettingsStore } from "../stores/settingsStore.js";
 import { TraceStore } from "../stores/traceStore.js";
+import { UserPromptStore } from "../stores/userPromptStore.js";
+import { VerificationArtifactStore } from "../stores/verificationArtifactStore.js";
 
 function createContext(): RouteContext {
   return {
@@ -25,7 +33,11 @@ function createContext(): RouteContext {
     traces: new TraceStore(),
     providers: new ProviderStore(),
     settings: new SettingsStore(),
-    modelPerformance: new ModelPerformanceStore()
+    modelPerformance: new ModelPerformanceStore(),
+    conversations: new ConversationStore(),
+    userPrompts: new UserPromptStore(),
+    verificationArtifacts: new VerificationArtifactStore(),
+    promotions: new PromotionStore()
   };
 }
 
@@ -117,6 +129,33 @@ test("settings route stores onboarding completion metadata", () => {
   assert.equal(payload.trialTaskCompleted, "both");
 });
 
+test("settings route updates retention and cleanup policy", () => {
+  const ctx = createContext();
+  const updated = handleSettingsRoute(
+    "/api/settings",
+    "PUT",
+    {
+      traceRetentionDays: 14,
+      artifactRetentionDays: 21,
+      promptRetentionDays: 10,
+      cleanupIntervalMinutes: 5
+    },
+    ctx
+  );
+  assert.ok(updated);
+  assert.equal(updated.status, 200);
+  const payload = updated.body as {
+    traceRetentionDays: number;
+    artifactRetentionDays: number;
+    promptRetentionDays: number;
+    cleanupIntervalMinutes: number;
+  };
+  assert.equal(payload.traceRetentionDays, 14);
+  assert.equal(payload.artifactRetentionDays, 21);
+  assert.equal(payload.promptRetentionDays, 10);
+  assert.equal(payload.cleanupIntervalMinutes, 5);
+});
+
 test("approval route supports tool-scoped approval lifecycle", () => {
   const ctx = createContext();
   const run = handleRunsRoute("/api/runs", "POST", { projectId: "p1", objective: "needs tool approval" }, ctx);
@@ -185,8 +224,15 @@ test("execution state route persists and clears checkpoints", () => {
     {
       state: {
         phase: "checkpointed",
+        phaseMarker: "executing",
         turn: 2,
-        checkpoint: { reason: "tool_result", messageCount: 10 }
+        checkpoint: { reason: "tool_result", messageCount: 10 },
+        replayBoundary: {
+          turn: 2,
+          reason: "tool_result",
+          contextHash: "hash-1",
+          createdAt: new Date().toISOString()
+        }
       }
     },
     ctx
@@ -249,4 +295,134 @@ test("model performance route records and returns aggregates", () => {
   assert.ok(list);
   assert.equal(list.status, 200);
   assert.ok(Array.isArray(list.body));
+});
+
+test("conversation threads and prompts route lifecycle", () => {
+  const ctx = createContext();
+  const run = handleRunsRoute("/api/runs", "POST", { projectId: "p3", objective: "threading" }, ctx);
+  assert.ok(run);
+  const runId = (run.body as { runId: string }).runId;
+  const thread = handleConversationThreadsRoute("/api/threads", "POST", { runId, title: "Thread A" }, ctx);
+  assert.ok(thread);
+  assert.equal(thread.status, 201);
+  const threadId = (thread.body as { threadId: string }).threadId;
+  const appended = handleConversationThreadsRoute(`/api/threads/${threadId}/messages`, "POST", { role: "user", content: "hello", turnNumber: 1 }, ctx);
+  assert.ok(appended);
+  assert.equal(appended.status, 201);
+  const prompt = handleUserPromptsRoute(
+    "/api/prompts",
+    "POST",
+    { runId, threadId, promptText: "Choose framework?", turnNumber: 1 },
+    ctx
+  );
+  assert.ok(prompt);
+  assert.equal(prompt.status, 201);
+  const promptId = (prompt.body as { promptId: string }).promptId;
+  const answered = handleUserPromptsRoute(`/api/prompts/${promptId}/answer`, "POST", { responseText: "Use React" }, ctx);
+  assert.ok(answered);
+  assert.equal(answered.status, 200);
+});
+
+test("verification artifact and promotion routes", () => {
+  const ctx = createContext();
+  const run = handleRunsRoute("/api/runs", "POST", { projectId: "p4", objective: "promotion test" }, ctx);
+  assert.ok(run);
+  const runId = (run.body as { runId: string }).runId;
+
+  const artifact = handleVerificationArtifactsRoute(
+    "/api/artifacts",
+    "POST",
+    {
+      runId,
+      verificationType: "tool_outcome",
+      artifactType: "log",
+      verificationResult: "pass",
+      artifactContent: "exit 0"
+    },
+    ctx
+  );
+  assert.ok(artifact);
+  assert.equal(artifact.status, 201);
+
+  const criteria = handlePromotionsRoute("/api/promotions/criteria", "GET", undefined, ctx);
+  assert.ok(criteria);
+  assert.equal(criteria.status, 200);
+  const criterionId = ((criteria.body as Array<{ criterionId: string }>)[0] ?? { criterionId: "default-v1" }).criterionId;
+
+  const evalResult = handlePromotionsRoute(
+    "/api/promotions/evaluations",
+    "POST",
+    {
+      runId,
+      criterionId,
+      aggregateScore: 0.91,
+      safetyViolations: 0,
+      verificationPassRate: 1,
+      reason: "all checks passed"
+    },
+    ctx
+  );
+  assert.ok(evalResult);
+  assert.equal(evalResult.status, 201);
+});
+
+test("promotion route blocks unsafe promotions with reject reasons", () => {
+  const ctx = createContext();
+  const run = handleRunsRoute("/api/runs", "POST", { projectId: "p5", objective: "promotion reject test" }, ctx);
+  assert.ok(run);
+  const runId = (run.body as { runId: string }).runId;
+  const evalResult = handlePromotionsRoute(
+    "/api/promotions/evaluations",
+    "POST",
+    {
+      runId,
+      criterionId: "default-v1",
+      aggregateScore: 0.2,
+      safetyViolations: 2,
+      verificationPassRate: 0.1,
+      reason: "forced reject"
+    },
+    ctx
+  );
+  assert.ok(evalResult);
+  assert.equal(evalResult.status, 201);
+  const payload = evalResult.body as { evaluationResult: string; rejectReasons?: string[] };
+  assert.equal(payload.evaluationResult, "rejected");
+  assert.ok(Array.isArray(payload.rejectReasons));
+  assert.ok((payload.rejectReasons ?? []).length >= 1);
+});
+
+test("retention prune removes stale traces/prompts/artifacts", () => {
+  const ctx = createContext();
+  const run = handleRunsRoute("/api/runs", "POST", { projectId: "p-retention", objective: "retention" }, ctx);
+  assert.ok(run);
+  const runId = (run.body as { runId: string }).runId;
+
+  handleTracesRoute(`/api/traces/${runId}`, "POST", { eventType: "llm.turn", payload: { durationMs: 10 } }, ctx);
+  handleVerificationArtifactsRoute(
+    "/api/artifacts",
+    "POST",
+    {
+      runId,
+      verificationType: "tool_outcome",
+      artifactType: "log",
+      verificationResult: "pass",
+      artifactContent: "ok"
+    },
+    ctx
+  );
+  const prompt = handleUserPromptsRoute(
+    "/api/prompts",
+    "POST",
+    { runId, turnNumber: 1, promptText: "Need answer?" },
+    ctx
+  );
+  assert.ok(prompt);
+  const promptId = (prompt.body as { promptId: string }).promptId;
+  handleUserPromptsRoute(`/api/prompts/${promptId}/answer`, "POST", { responseText: "yes" }, ctx);
+
+  const futureNow = Date.now() + 90 * 24 * 60 * 60 * 1000;
+  assert.ok(ctx.traces.pruneOlderThan(30, futureNow) >= 1);
+  assert.ok(ctx.verificationArtifacts.pruneOlderThan(30, futureNow) >= 1);
+  assert.ok(ctx.userPrompts.pruneOlderThan(30, futureNow) >= 1);
 });

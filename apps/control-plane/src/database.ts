@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 8;
 let instance: Database.Database | undefined;
 
 export function getControlPlaneDatabase(): Database.Database {
@@ -92,12 +92,94 @@ function ensureSchema(db: Database.Database): void {
       recorded_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS conversation_threads (
+      thread_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      parent_thread_id TEXT,
+      title TEXT,
+      metadata_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      thread_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      turn_number INTEGER NOT NULL,
+      metadata_json TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_prompts (
+      prompt_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      thread_id TEXT,
+      turn_number INTEGER NOT NULL,
+      prompt_text TEXT NOT NULL,
+      context_json TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      requested_at TEXT NOT NULL,
+      answered_at TEXT,
+      response_text TEXT,
+      expires_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS verification_artifacts (
+      artifact_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      verification_type TEXT NOT NULL,
+      artifact_type TEXT NOT NULL,
+      artifact_content TEXT,
+      verification_result TEXT NOT NULL,
+      checks_json TEXT,
+      verified_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS promotion_criteria (
+      criterion_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      min_aggregate_score REAL NOT NULL,
+      max_safety_violations INTEGER NOT NULL,
+      min_verification_pass_rate REAL NOT NULL,
+      max_latency_ms INTEGER,
+      max_estimated_cost_usd REAL,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS promotion_evaluations (
+      evaluation_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      criterion_id TEXT NOT NULL,
+      evaluation_result TEXT NOT NULL,
+      aggregate_score REAL NOT NULL,
+      safety_violations INTEGER NOT NULL,
+      verification_pass_rate REAL NOT NULL,
+      latency_ms INTEGER,
+      estimated_cost_usd REAL,
+      evaluated_at TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      reject_reasons_json TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_traces_run_id ON traces(run_id, id);
     CREATE INDEX IF NOT EXISTS idx_model_performance_provider_mode ON model_performance(provider_id, routing_mode, id);
+    CREATE INDEX IF NOT EXISTS idx_threads_run_id ON conversation_threads(run_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_messages_thread_turn ON conversation_messages(thread_id, turn_number, id);
+    CREATE INDEX IF NOT EXISTS idx_prompts_run_status ON user_prompts(run_id, status, requested_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_artifacts_run_verified ON verification_artifacts(run_id, verified_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_promotions_run_eval ON promotion_evaluations(run_id, evaluated_at DESC);
   `);
 
   ensureProvidersColumns(db);
   ensureApprovalColumns(db);
+  ensurePromotionColumns(db);
+  ensureSettingsRows(db);
+  verifySchemaHealth(db);
 
   db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(
     SCHEMA_VERSION,
@@ -153,6 +235,40 @@ function seedData(db: Database.Database): void {
   const egressAllowHosts = db.prepare("SELECT key FROM settings WHERE key = ?").get("egressAllowHosts");
   if (!egressAllowHosts) {
     db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("egressAllowHosts", "[]");
+  }
+  const traceRetentionDays = db.prepare("SELECT key FROM settings WHERE key = ?").get("traceRetentionDays");
+  if (!traceRetentionDays) {
+    db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("traceRetentionDays", "30");
+  }
+  const artifactRetentionDays = db.prepare("SELECT key FROM settings WHERE key = ?").get("artifactRetentionDays");
+  if (!artifactRetentionDays) {
+    db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("artifactRetentionDays", "30");
+  }
+  const promptRetentionDays = db.prepare("SELECT key FROM settings WHERE key = ?").get("promptRetentionDays");
+  if (!promptRetentionDays) {
+    db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("promptRetentionDays", "30");
+  }
+  const cleanupIntervalMinutes = db.prepare("SELECT key FROM settings WHERE key = ?").get("cleanupIntervalMinutes");
+  if (!cleanupIntervalMinutes) {
+    db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("cleanupIntervalMinutes", "15");
+  }
+
+  const criterion = db.prepare("SELECT criterion_id FROM promotion_criteria WHERE criterion_id = ?").get("default-v1");
+  if (!criterion) {
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO promotion_criteria (criterion_id, name, description, min_aggregate_score, max_safety_violations, min_verification_pass_rate, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(
+      "default-v1",
+      "Default Safety-Quality Gate",
+      "Promote only when quality and safety pass baseline thresholds.",
+      0.75,
+      0,
+      0.75,
+      1,
+      now,
+      now
+    );
   }
 }
 
@@ -221,6 +337,79 @@ function ensureApprovalColumns(db: Database.Database): void {
       if (!(error instanceof Error) || !error.message.includes("duplicate column name")) {
         throw error;
       }
+    }
+  }
+}
+
+function ensurePromotionColumns(db: Database.Database): void {
+  const criteriaCols = db.prepare("PRAGMA table_info(promotion_criteria)").all() as Array<{ name: string }>;
+  const evalCols = db.prepare("PRAGMA table_info(promotion_evaluations)").all() as Array<{ name: string }>;
+  addColumnIfMissing(db, "promotion_criteria", criteriaCols, "max_latency_ms INTEGER");
+  addColumnIfMissing(db, "promotion_criteria", criteriaCols, "max_estimated_cost_usd REAL");
+  addColumnIfMissing(db, "promotion_evaluations", evalCols, "latency_ms INTEGER");
+  addColumnIfMissing(db, "promotion_evaluations", evalCols, "estimated_cost_usd REAL");
+  addColumnIfMissing(db, "promotion_evaluations", evalCols, "reject_reasons_json TEXT");
+}
+
+function addColumnIfMissing(
+  db: Database.Database,
+  tableName: string,
+  columns: Array<{ name: string }>,
+  columnSql: string
+): void {
+  const columnName = columnSql.split(" ")[0];
+  if (columns.some((column) => column.name === columnName)) return;
+  try {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnSql}`);
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("duplicate column name")) {
+      throw error;
+    }
+  }
+}
+
+function ensureSettingsRows(db: Database.Database): void {
+  const requiredSettings: Array<{ key: string; value: string }> = [
+    { key: "traceRetentionDays", value: "30" },
+    { key: "artifactRetentionDays", value: "30" },
+    { key: "promptRetentionDays", value: "30" },
+    { key: "cleanupIntervalMinutes", value: "15" }
+  ];
+  const upsert = db.prepare(
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = COALESCE(settings.value, excluded.value)"
+  );
+  for (const setting of requiredSettings) {
+    upsert.run(setting.key, setting.value);
+  }
+}
+
+function verifySchemaHealth(db: Database.Database): void {
+  const health = db.pragma("integrity_check", { simple: true }) as string;
+  if (typeof health === "string" && health.toLowerCase() !== "ok") {
+    throw new Error(`SQLite integrity_check failed: ${health}`);
+  }
+  const expectedTables = [
+    "runs",
+    "approvals",
+    "providers",
+    "settings",
+    "traces",
+    "execution_state",
+    "model_performance",
+    "conversation_threads",
+    "conversation_messages",
+    "user_prompts",
+    "verification_artifacts",
+    "promotion_criteria",
+    "promotion_evaluations"
+  ];
+  const rows = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+    .all() as Array<{ name: string }>;
+  const names = new Set(rows.map((row) => row.name));
+  for (const table of expectedTables) {
+    if (!names.has(table)) {
+      throw new Error(`Schema health check failed. Missing table: ${table}`);
     }
   }
 }

@@ -1,11 +1,13 @@
 export interface PersistedExecutionState {
   runId: string;
   phase: "created" | "approved" | "running" | "checkpointed" | "completed" | "failed" | "aborted";
+  phaseMarker?: "planning" | "executing" | "awaiting_user" | "reflecting" | "finalizing";
   turn: number;
   input: {
     providerId?: string;
     directory?: string;
     objective?: string;
+    threadId?: string;
   };
   stats: {
     actionCount: number;
@@ -19,6 +21,12 @@ export interface PersistedExecutionState {
     at: string;
     reason: string;
     messageCount: number;
+  };
+  replayBoundary?: {
+    turn: number;
+    reason: string;
+    contextHash: string;
+    createdAt: string;
   };
   lastError?: string;
 }

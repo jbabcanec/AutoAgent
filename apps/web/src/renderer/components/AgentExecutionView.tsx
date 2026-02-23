@@ -332,6 +332,16 @@ function ToolCallEntry({
 // --- Setup Line ---
 
 function SetupLine({ step }: { step: RunStatusEvent }): React.JSX.Element {
+  const typeLabel =
+    step.type === "plan"
+      ? "[plan]"
+      : step.type === "reflection"
+        ? "[reflection]"
+        : step.type === "ask_user"
+          ? "[ask-user]"
+          : step.type === "follow_up"
+            ? "[follow-up]"
+            : "";
   return (
     <div className="flex items-start gap-2 py-0.5 text-xs font-mono">
       <span className="h-3 w-3 flex items-center justify-center mt-0.5 shrink-0">
@@ -347,7 +357,7 @@ function SetupLine({ step }: { step: RunStatusEvent }): React.JSX.Element {
         "flex-1",
         step.type === "error" ? "text-red-400" : "text-zinc-500"
       )}>
-        {step.message}
+        {typeLabel ? `${typeLabel} ${step.message}` : step.message}
       </span>
     </div>
   );

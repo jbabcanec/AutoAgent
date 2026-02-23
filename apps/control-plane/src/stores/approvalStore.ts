@@ -31,18 +31,19 @@ export class ApprovalStore {
         input.expiresAt ?? null,
         input.contextHash ?? null
       );
-    return {
+    const result: ApprovalItem = {
       id,
       runId: input.runId,
       reason: input.reason,
       requestedAt,
       status: "pending",
-      scope: input.scope ?? "run",
-      toolName: input.toolName,
-      toolInput: input.toolInput,
-      expiresAt: input.expiresAt,
-      contextHash: input.contextHash
+      scope: input.scope ?? "run"
     };
+    if (input.toolName !== undefined) result.toolName = input.toolName;
+    if (input.toolInput !== undefined) result.toolInput = input.toolInput;
+    if (input.expiresAt !== undefined) result.expiresAt = input.expiresAt;
+    if (input.contextHash !== undefined) result.contextHash = input.contextHash;
+    return result;
   }
 
   public list(): ApprovalItem[] {
@@ -60,18 +61,21 @@ export class ApprovalStore {
       expires_at: string | null;
       context_hash: string | null;
     }>;
-    return rows.map((row) => ({
-      id: row.id,
-      runId: row.run_id,
-      reason: row.reason,
-      requestedAt: row.requested_at,
-      status: row.status,
-      scope: row.scope,
-      toolName: row.tool_name ?? undefined,
-      toolInput: row.tool_input_json ? parsePayload(row.tool_input_json) : undefined,
-      expiresAt: row.expires_at ?? undefined,
-      contextHash: row.context_hash ?? undefined
-    }));
+    return rows.map((row) => {
+      const item: ApprovalItem = {
+        id: row.id,
+        runId: row.run_id,
+        reason: row.reason,
+        requestedAt: row.requested_at,
+        status: row.status,
+        scope: row.scope
+      };
+      if (row.tool_name !== null) item.toolName = row.tool_name;
+      if (row.tool_input_json !== null) item.toolInput = parsePayload(row.tool_input_json);
+      if (row.expires_at !== null) item.expiresAt = row.expires_at;
+      if (row.context_hash !== null) item.contextHash = row.context_hash;
+      return item;
+    });
   }
 
   public resolve(
@@ -101,6 +105,9 @@ export class ApprovalStore {
       this.db.prepare("UPDATE approvals SET status = 'rejected' WHERE id = ?").run(id);
       return { error: "expired" };
     }
+    if (row.context_hash && !expectedContextHash) {
+      return { error: "context_mismatch" };
+    }
     if (expectedContextHash && row.context_hash && expectedContextHash !== row.context_hash) {
       return { error: "context_mismatch" };
     }
@@ -112,12 +119,12 @@ export class ApprovalStore {
       reason: row.reason,
       requestedAt: row.requested_at,
       status: approved ? "approved" : "rejected",
-      scope: row.scope,
-      toolName: row.tool_name ?? undefined,
-      toolInput: row.tool_input_json ? parsePayload(row.tool_input_json) : undefined,
-      expiresAt: row.expires_at ?? undefined,
-      contextHash: row.context_hash ?? undefined
+      scope: row.scope
     };
+    if (row.tool_name !== null) item.toolName = row.tool_name;
+    if (row.tool_input_json !== null) item.toolInput = parsePayload(row.tool_input_json);
+    if (row.expires_at !== null) item.expiresAt = row.expires_at;
+    if (row.context_hash !== null) item.contextHash = row.context_hash;
     return { item };
   }
 }

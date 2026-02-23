@@ -15,14 +15,17 @@ export class RunStore {
       updated_at: string;
       summary: string | null;
     }>;
-    return rows.map((row) => ({
-      runId: row.run_id,
-      projectId: row.project_id,
-      status: row.status,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      summary: row.summary ?? undefined
-    }));
+    return rows.map((row) => {
+      const item: RunItem = {
+        runId: row.run_id,
+        projectId: row.project_id,
+        status: row.status,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      };
+      if (row.summary !== null) item.summary = row.summary;
+      return item;
+    });
   }
 
   public get(runId: string): RunItem | undefined {
@@ -39,14 +42,15 @@ export class RunStore {
         }
       | undefined;
     if (!row) return undefined;
-    return {
+    const item: RunItem = {
       runId: row.run_id,
       projectId: row.project_id,
       status: row.status,
       createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      summary: row.summary ?? undefined
+      updatedAt: row.updated_at
     };
+    if (row.summary !== null) item.summary = row.summary;
+    return item;
   }
 
   public updateStatus(runId: string, status: RunItem["status"], summary?: string): void {

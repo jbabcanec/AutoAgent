@@ -6,6 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/server.ts",
+    "db:backup": "tsx src/scripts/dbAdmin.ts backup",
+    "db:restore": "tsx src/scripts/dbAdmin.ts restore",
     "lint": "node -e \"console.log('lint: pending')\"",
     "test": "tsx --test src/__tests__/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
