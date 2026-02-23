@@ -85,5 +85,26 @@ AutoAgent is an open-source, provider-agnostic developer agent platform with gua
   - `traceRetentionDays`
   - `artifactRetentionDays`
   - `promptRetentionDays`
+  - `promptCacheRetentionDays`
   - `cleanupIntervalMinutes`
 - Cleanup executes on control-plane startup and then on a fixed interval.
+
+## Agent tooling uplift
+
+- Built-in coding tools now include:
+  - `edit_file`
+  - `search_code`
+  - `glob_files`
+  - `git_status`, `git_diff`, `git_add`, `git_commit` (guarded subset)
+- `run_command` now uses async process execution with timeout and abort handling.
+- Run timeline supports incremental assistant deltas for streaming-like UX.
+
+## Project-level agent config
+
+- Optional file at repo root: `.autoagent.json`
+- Supported fields:
+  - `toolAllowlist` (array of tool names)
+  - `preferredModel`
+  - `maxTokens`
+  - `contextHistoryMaxMessages`
+  - `contextSummaryMaxChars`

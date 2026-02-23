@@ -6,6 +6,7 @@ import { handleDashboardRoute } from "./routes/dashboard.js";
 import { handleExecutionStateRoute } from "./routes/executionState.js";
 import { handleModelPerformanceRoute } from "./routes/modelPerformance.js";
 import { handlePromotionsRoute } from "./routes/promotions.js";
+import { handlePromptCacheRoute } from "./routes/promptCache.js";
 import { handleProvidersRoute } from "./routes/providers.js";
 import { handleRunsRoute } from "./routes/runs.js";
 import { handleSettingsRoute } from "./routes/settings.js";
@@ -19,6 +20,7 @@ import { ExecutionStateStore } from "./stores/executionStateStore.js";
 import { ModelPerformanceStore } from "./stores/modelPerformanceStore.js";
 import { PromotionStore } from "./stores/promotionStore.js";
 import { ProviderStore } from "./stores/providerStore.js";
+import { PromptCacheStore } from "./stores/promptCacheStore.js";
 import { RunStore } from "./stores/runStore.js";
 import { SettingsStore } from "./stores/settingsStore.js";
 import { TraceStore } from "./stores/traceStore.js";
@@ -36,7 +38,8 @@ const ctx: RouteContext = {
   conversations: new ConversationStore(),
   userPrompts: new UserPromptStore(),
   verificationArtifacts: new VerificationArtifactStore(),
-  promotions: new PromotionStore()
+  promotions: new PromotionStore(),
+  promptCache: new PromptCacheStore()
 };
 
 let cleanupTimer: NodeJS.Timeout | undefined;
@@ -46,10 +49,11 @@ function runRetentionCleanup(): void {
   const tracesPruned = ctx.traces.pruneOlderThan(settings.traceRetentionDays ?? 30);
   const artifactsPruned = ctx.verificationArtifacts.pruneOlderThan(settings.artifactRetentionDays ?? 30);
   const promptsPruned = ctx.userPrompts.pruneOlderThan(settings.promptRetentionDays ?? 30);
+  const cachePruned = ctx.promptCache.pruneOlderThan(settings.promptCacheRetentionDays ?? 7);
   // eslint-disable-next-line no-console
   console.log(
-    `[retention] traces=${tracesPruned} artifacts=${artifactsPruned} prompts=${promptsPruned} ` +
-      `(days: ${settings.traceRetentionDays ?? 30}/${settings.artifactRetentionDays ?? 30}/${settings.promptRetentionDays ?? 30})`
+    `[retention] traces=${tracesPruned} artifacts=${artifactsPruned} prompts=${promptsPruned} cache=${cachePruned} ` +
+      `(days: ${settings.traceRetentionDays ?? 30}/${settings.artifactRetentionDays ?? 30}/${settings.promptRetentionDays ?? 30}/${settings.promptCacheRetentionDays ?? 7})`
   );
 }
 
@@ -94,6 +98,7 @@ function route(pathname: string, method: string, body: unknown): RouteResult | u
     handleModelPerformanceRoute(pathname, method, body, ctx) ??
     handleUserPromptsRoute(pathname, method, body, ctx) ??
     handleVerificationArtifactsRoute(pathname, method, body, ctx) ??
+    handlePromptCacheRoute(pathname, method, body, ctx) ??
     handlePromotionsRoute(pathname, method, body, ctx) ??
     handleTracesRoute(pathname, method, body, ctx) ??
     handleSettingsRoute(pathname, method, body, ctx) ??

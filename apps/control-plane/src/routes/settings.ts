@@ -58,6 +58,9 @@ export function handleSettingsRoute(
     if (typeof payload.cleanupIntervalMinutes === "number" && payload.cleanupIntervalMinutes > 0) {
       updates.cleanupIntervalMinutes = payload.cleanupIntervalMinutes;
     }
+    if (typeof payload.promptCacheRetentionDays === "number" && payload.promptCacheRetentionDays > 0) {
+      updates.promptCacheRetentionDays = payload.promptCacheRetentionDays;
+    }
     return {
       status: 200,
       body: ctx.settings.update(updates)

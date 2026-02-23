@@ -72,6 +72,8 @@ export function RunsPage({
       policyRetries: number;
       planningEvents: number;
       reflectionEvents: number;
+      cacheHits: number;
+      cacheMisses: number;
     }
   >;
   onResumeRun: (runId: string) => void | Promise<void>;
@@ -194,6 +196,8 @@ function TaskCard({
         policyRetries: number;
         planningEvents: number;
         reflectionEvents: number;
+        cacheHits: number;
+        cacheMisses: number;
       }
     | undefined;
   onResume: () => void | Promise<void>;
@@ -361,6 +365,7 @@ function TaskCard({
                 <span>Verify: {metrics?.verificationPassed ?? 0}/{(metrics?.verificationPassed ?? 0) + (metrics?.verificationFailed ?? 0)}</span>
                 <span>Egress denied: {metrics?.egressDenied ?? 0}</span>
                 <span>Plan/reflect: {metrics?.planningEvents ?? 0}/{metrics?.reflectionEvents ?? 0}</span>
+                <span>Cache h/m: {metrics?.cacheHits ?? 0}/{metrics?.cacheMisses ?? 0}</span>
                 <span>Cost: ${metrics?.estimatedCostUsd?.toFixed(4) ?? "0.0000"}</span>
               </div>
               <div className="flex items-center gap-2">

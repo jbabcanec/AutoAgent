@@ -17,6 +17,7 @@ export class SettingsStore {
     const artifactRetentionDays = this.getValue("artifactRetentionDays");
     const promptRetentionDays = this.getValue("promptRetentionDays");
     const cleanupIntervalMinutes = this.getValue("cleanupIntervalMinutes");
+    const promptCacheRetentionDays = this.getValue("promptCacheRetentionDays");
     const result: SettingsItem = {
       requireApproval: requireApproval !== "false",
       hasCompletedOnboarding: hasCompletedOnboarding === "true",
@@ -36,6 +37,7 @@ export class SettingsStore {
     result.artifactRetentionDays = parsePositiveInt(artifactRetentionDays, 30);
     result.promptRetentionDays = parsePositiveInt(promptRetentionDays, 30);
     result.cleanupIntervalMinutes = parsePositiveInt(cleanupIntervalMinutes, 15);
+    result.promptCacheRetentionDays = parsePositiveInt(promptCacheRetentionDays, 7);
     return result;
   }
 
@@ -53,6 +55,7 @@ export class SettingsStore {
     this.setValue("artifactRetentionDays", String(next.artifactRetentionDays ?? 30));
     this.setValue("promptRetentionDays", String(next.promptRetentionDays ?? 30));
     this.setValue("cleanupIntervalMinutes", String(next.cleanupIntervalMinutes ?? 15));
+    this.setValue("promptCacheRetentionDays", String(next.promptCacheRetentionDays ?? 7));
     return next;
   }
 

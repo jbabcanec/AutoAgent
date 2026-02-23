@@ -54,6 +54,8 @@
 4. Submit an answer and confirm execution resumes automatically.
 5. Verify reflection event appears before final completion.
 6. Verify follow-up actions are shown and launching one creates a new run.
+7. Verify incremental assistant deltas appear during turns (not only final text blocks).
+8. Verify tool calls include `search_code`, `glob_files`, `edit_file`, and guarded git tools when requested by objective.
 
 ## Verification + promotion checks
 
@@ -79,6 +81,15 @@
   - `traceRetentionDays`, `artifactRetentionDays`, `promptRetentionDays`, `cleanupIntervalMinutes`.
 - Restart control-plane and confirm retention cleanup logs print prune counts.
 - Confirm old answered prompts/artifacts/traces are pruned while active runs remain intact.
+- Confirm prompt cache entries are pruned according to `promptCacheRetentionDays`.
+
+## Agent capability uplift checks
+
+- Add `.autoagent.json` in a test repo with `toolAllowlist` and verify disallowed tools are blocked.
+- Run objective requiring `search_code` + `glob_files` + `edit_file`; verify successful end-to-end edits.
+- Run objective requesting git workflow; verify `git_status`, `git_diff`, `git_add`, `git_commit` execute and are still approval/policy governed.
+- Run objective long enough to exceed history budget and verify compressed context traces continue execution without runaway prompt growth.
+- Re-run identical prompt objective and verify cache hit metrics (`cacheHits/cacheMisses`) are visible in task metrics row.
 
 ## Key security checks
 

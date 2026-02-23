@@ -6,6 +6,7 @@ import { handleDashboardRoute } from "../routes/dashboard.js";
 import { handleExecutionStateRoute } from "../routes/executionState.js";
 import { handleModelPerformanceRoute } from "../routes/modelPerformance.js";
 import { handlePromotionsRoute } from "../routes/promotions.js";
+import { handlePromptCacheRoute } from "../routes/promptCache.js";
 import { handleProvidersRoute } from "../routes/providers.js";
 import { handleRunsRoute } from "../routes/runs.js";
 import { handleSettingsRoute } from "../routes/settings.js";
@@ -19,6 +20,7 @@ import { ExecutionStateStore } from "../stores/executionStateStore.js";
 import { ModelPerformanceStore } from "../stores/modelPerformanceStore.js";
 import { PromotionStore } from "../stores/promotionStore.js";
 import { ProviderStore } from "../stores/providerStore.js";
+import { PromptCacheStore } from "../stores/promptCacheStore.js";
 import { RunStore } from "../stores/runStore.js";
 import { SettingsStore } from "../stores/settingsStore.js";
 import { TraceStore } from "../stores/traceStore.js";
@@ -37,7 +39,8 @@ function createContext(): RouteContext {
     conversations: new ConversationStore(),
     userPrompts: new UserPromptStore(),
     verificationArtifacts: new VerificationArtifactStore(),
-    promotions: new PromotionStore()
+    promotions: new PromotionStore(),
+    promptCache: new PromptCacheStore()
   };
 }
 
@@ -425,4 +428,16 @@ test("retention prune removes stale traces/prompts/artifacts", () => {
   assert.ok(ctx.traces.pruneOlderThan(30, futureNow) >= 1);
   assert.ok(ctx.verificationArtifacts.pruneOlderThan(30, futureNow) >= 1);
   assert.ok(ctx.userPrompts.pruneOlderThan(30, futureNow) >= 1);
+});
+
+test("prompt cache route writes and reads cached values", () => {
+  const ctx = createContext();
+  const key = "cache-key-smoke";
+  const write = handlePromptCacheRoute(`/api/prompt-cache/${key}`, "POST", { value: { text: "cached" } }, ctx);
+  assert.ok(write);
+  assert.equal(write.status, 201);
+  const read = handlePromptCacheRoute(`/api/prompt-cache/${key}`, "GET", undefined, ctx);
+  assert.ok(read);
+  assert.equal(read.status, 200);
+  assert.equal((read.body as { hit: boolean }).hit, true);
 });

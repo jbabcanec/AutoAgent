@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 let instance: Database.Database | undefined;
 
 export function getControlPlaneDatabase(): Database.Database {
@@ -166,6 +166,14 @@ function ensureSchema(db: Database.Database): void {
       reject_reasons_json TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS prompt_cache (
+      key TEXT PRIMARY KEY,
+      value_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      hit_count INTEGER NOT NULL DEFAULT 0
+    );
+
     CREATE INDEX IF NOT EXISTS idx_traces_run_id ON traces(run_id, id);
     CREATE INDEX IF NOT EXISTS idx_model_performance_provider_mode ON model_performance(provider_id, routing_mode, id);
     CREATE INDEX IF NOT EXISTS idx_threads_run_id ON conversation_threads(run_id, updated_at DESC);
@@ -173,6 +181,7 @@ function ensureSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_prompts_run_status ON user_prompts(run_id, status, requested_at DESC);
     CREATE INDEX IF NOT EXISTS idx_artifacts_run_verified ON verification_artifacts(run_id, verified_at DESC);
     CREATE INDEX IF NOT EXISTS idx_promotions_run_eval ON promotion_evaluations(run_id, evaluated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_prompt_cache_updated ON prompt_cache(updated_at DESC);
   `);
 
   ensureProvidersColumns(db);
@@ -251,6 +260,10 @@ function seedData(db: Database.Database): void {
   const cleanupIntervalMinutes = db.prepare("SELECT key FROM settings WHERE key = ?").get("cleanupIntervalMinutes");
   if (!cleanupIntervalMinutes) {
     db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("cleanupIntervalMinutes", "15");
+  }
+  const promptCacheRetentionDays = db.prepare("SELECT key FROM settings WHERE key = ?").get("promptCacheRetentionDays");
+  if (!promptCacheRetentionDays) {
+    db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("promptCacheRetentionDays", "7");
   }
 
   const criterion = db.prepare("SELECT criterion_id FROM promotion_criteria WHERE criterion_id = ?").get("default-v1");
@@ -374,6 +387,7 @@ function ensureSettingsRows(db: Database.Database): void {
     { key: "artifactRetentionDays", value: "30" },
     { key: "promptRetentionDays", value: "30" },
     { key: "cleanupIntervalMinutes", value: "15" }
+    , { key: "promptCacheRetentionDays", value: "7" }
   ];
   const upsert = db.prepare(
     "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = COALESCE(settings.value, excluded.value)"
@@ -402,6 +416,8 @@ function verifySchemaHealth(db: Database.Database): void {
     "verification_artifacts",
     "promotion_criteria",
     "promotion_evaluations"
+    ,
+    "prompt_cache"
   ];
   const rows = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")

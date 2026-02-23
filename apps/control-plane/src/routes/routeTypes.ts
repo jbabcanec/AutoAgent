@@ -4,6 +4,7 @@ import type { ExecutionStateStore } from "../stores/executionStateStore.js";
 import type { ModelPerformanceStore } from "../stores/modelPerformanceStore.js";
 import type { PromotionStore } from "../stores/promotionStore.js";
 import type { ProviderStore } from "../stores/providerStore.js";
+import type { PromptCacheStore } from "../stores/promptCacheStore.js";
 import type { RunStore } from "../stores/runStore.js";
 import type { SettingsStore } from "../stores/settingsStore.js";
 import type { TraceStore } from "../stores/traceStore.js";
@@ -22,6 +23,7 @@ export interface RouteContext {
   userPrompts: UserPromptStore;
   verificationArtifacts: VerificationArtifactStore;
   promotions: PromotionStore;
+  promptCache: PromptCacheStore;
 }
 
 export interface RouteResult {

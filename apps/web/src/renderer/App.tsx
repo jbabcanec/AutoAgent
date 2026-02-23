@@ -82,6 +82,8 @@ export function App(): React.JSX.Element {
         policyRetries: number;
         planningEvents: number;
         reflectionEvents: number;
+        cacheHits: number;
+        cacheMisses: number;
       }
     >
   >({});
@@ -189,6 +191,8 @@ export function App(): React.JSX.Element {
         policyRetries: number;
         planningEvents: number;
         reflectionEvents: number;
+        cacheHits: number;
+        cacheMisses: number;
       };
       setRunMetrics((prev) => ({ ...prev, [runId]: metrics }));
     } catch {

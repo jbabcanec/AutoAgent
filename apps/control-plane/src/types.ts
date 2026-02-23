@@ -46,6 +46,7 @@ export interface SettingsItem {
   artifactRetentionDays?: number;
   promptRetentionDays?: number;
   cleanupIntervalMinutes?: number;
+  promptCacheRetentionDays?: number;
 }
 
 export interface ModelPerformanceItem {
@@ -141,4 +142,12 @@ export interface ProviderItem {
   baseUrl: string;
   defaultModel?: string;
   apiKeyStored: boolean;
+}
+
+export interface PromptCacheItem {
+  key: string;
+  value: unknown;
+  createdAt: string;
+  updatedAt: string;
+  hitCount: number;
 }

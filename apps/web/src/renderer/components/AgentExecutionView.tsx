@@ -186,7 +186,7 @@ function TurnGroup({ turn }: { turn: TurnData }): React.JSX.Element {
 
   const toolCalls = turn.events.filter((e) => e.type === "tool_call");
   const toolResults = turn.events.filter((e) => e.type === "tool_result");
-  const llmTexts = turn.events.filter((e) => e.type === "llm_text");
+  const llmTexts = turn.events.filter((e) => e.type === "llm_text" || e.type === "llm_delta");
 
   // Pair tool calls with their results
   const toolPairs: Array<{ call: RunStatusEvent; result: RunStatusEvent | null }> = toolCalls.map((call, i) => ({
@@ -399,9 +399,17 @@ function groupByTurns(steps: RunStatusEvent[], isExecuting: boolean): TurnData[]
 function getToolIcon(toolName: string): React.ElementType {
   switch (toolName) {
     case "write_file":
+    case "edit_file":
     case "read_file":
       return File;
+    case "search_code":
+    case "glob_files":
+      return FolderOpen;
     case "run_command":
+    case "git_status":
+    case "git_diff":
+    case "git_add":
+    case "git_commit":
       return Terminal;
     case "list_directory":
       return FolderOpen;

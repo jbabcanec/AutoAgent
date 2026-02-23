@@ -53,6 +53,8 @@ export class TraceStore {
     verificationFailed: number;
     planningEvents: number;
     reflectionEvents: number;
+    cacheHits: number;
+    cacheMisses: number;
   } {
     const traces = this.listByRun(runId);
     let tokenInput = 0;
@@ -77,6 +79,8 @@ export class TraceStore {
     let verificationFailed = 0;
     let planningEvents = 0;
     let reflectionEvents = 0;
+    let cacheHits = 0;
+    let cacheMisses = 0;
 
     for (const trace of traces) {
       if (trace.eventType === "llm.response") {
@@ -122,6 +126,8 @@ export class TraceStore {
       }
       if (trace.eventType === "execution.plan") planningEvents += 1;
       if (trace.eventType === "execution.reflection") reflectionEvents += 1;
+      if (trace.eventType === "execution.cache_hit") cacheHits += 1;
+      if (trace.eventType === "execution.cache_miss") cacheMisses += 1;
     }
 
     return {
@@ -149,7 +155,9 @@ export class TraceStore {
       verificationPassed,
       verificationFailed,
       planningEvents,
-      reflectionEvents
+      reflectionEvents,
+      cacheHits,
+      cacheMisses
     };
   }
 

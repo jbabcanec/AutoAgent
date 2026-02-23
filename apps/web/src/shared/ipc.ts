@@ -29,7 +29,7 @@ export interface RunStatusEvent {
   message: string;
   timestamp: string;
   detail?: string;
-  type?: "info" | "tool_call" | "tool_result" | "llm_text" | "error" | "plan" | "reflection" | "ask_user" | "follow_up";
+  type?: "info" | "tool_call" | "tool_result" | "llm_text" | "llm_delta" | "error" | "plan" | "reflection" | "ask_user" | "follow_up";
   turn?: number;
   model?: string;
   tokenUsage?: { input: number; output: number };
@@ -100,6 +100,8 @@ export interface DesktopApi {
     verificationFailed: number;
     planningEvents: number;
     reflectionEvents: number;
+    cacheHits: number;
+    cacheMisses: number;
   }>;
   deleteRun(runId: string): Promise<{ deleted: boolean }>;
   startRun(input: StartRunInput): Promise<StartRunResult>;

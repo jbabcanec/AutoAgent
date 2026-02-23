@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +14,7 @@ import {
 } from "../shared/ipc.js";
 import { RunLifecycleMachine } from "./runLifecycle.js";
 import { deleteApiKey, getApiKey, hasApiKey, storeApiKey } from "./keychain.js";
-import { ANTHROPIC_TOOLS, OPENAI_TOOLS, executeTool } from "./agentTools.js";
+import { ANTHROPIC_TOOLS, OPENAI_TOOLS, executeToolAsync } from "./agentTools.js";
 import { buildLiveContext } from "./liveContextEngine.js";
 import { evaluateToolPolicy } from "./executionPolicy.js";
 import { inspectCommand } from "./commandValidator.js";
@@ -30,6 +31,7 @@ import {
 } from "./executionOrchestrator.js";
 import { scoreExecution } from "./evalFeedback.js";
 import { validateToolOutcome } from "./executionValidator.js";
+import { collectMcpToolDefinitions, executeMcpTool, registerMcpAdapter, clearMcpAdapters, type RegisteredMcpAdapter } from "./mcpRegistry.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -306,6 +308,7 @@ interface OpenAiToolCall {
 interface OpenAiResponse {
   choices?: Array<{
     message?: {
+      role?: string;
       content?: string | null;
       tool_calls?: OpenAiToolCall[];
     };
@@ -321,6 +324,7 @@ type AgentMessage =
   | { role: "tool"; tool_call_id: string; content: string };
 
 const MAX_AGENT_TURNS = 25;
+const PROMPT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 // --- Agentic LLM Callers ---
 
@@ -331,8 +335,16 @@ async function callAnthropicAgent(
   system: string,
   messages: AgentMessage[],
   maxTokens: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  cacheTraceRunId?: string
 ): Promise<AnthropicResponse> {
+  const cacheKey = createPromptCacheKey("anthropic-compatible", model, system, messages, maxTokens);
+  const cached = await readPromptCache(cacheKey);
+  if (cached) {
+    if (cacheTraceRunId) await appendTrace(cacheTraceRunId, "execution.cache_hit", { key: cacheKey, provider: "anthropic" });
+    return cached as AnthropicResponse;
+  }
+  if (cacheTraceRunId) await appendTrace(cacheTraceRunId, "execution.cache_miss", { key: cacheKey, provider: "anthropic" });
   // Convert messages to Anthropic format (no system role in messages array)
   const anthropicMessages = messages
     .filter((m) => m.role !== "system")
@@ -359,7 +371,145 @@ async function callAnthropicAgent(
     const text = await response.text();
     throw new Error(`Anthropic API error: ${response.status} ${text}`);
   }
-  return (await response.json()) as AnthropicResponse;
+  const parsed = (await response.json()) as AnthropicResponse;
+  await writePromptCache(cacheKey, parsed);
+  return parsed;
+}
+
+async function callAnthropicAgentStreaming(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  system: string,
+  messages: AgentMessage[],
+  maxTokens: number,
+  onDelta: (text: string) => void,
+  signal?: AbortSignal,
+  tools?: unknown[]
+): Promise<AnthropicResponse> {
+  const anthropicMessages = messages
+    .filter((m) => m.role !== "system")
+    .map((m) => ({ role: m.role === "tool" ? "user" : m.role, content: m.content }));
+
+  const body: Record<string, unknown> = {
+    model,
+    max_tokens: maxTokens,
+    system,
+    messages: anthropicMessages,
+    tools: tools ?? ANTHROPIC_TOOLS,
+    stream: true
+  };
+  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/messages`, {
+    method: "POST",
+    signal: signal ?? null,
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Anthropic API error: ${response.status} ${text}`);
+  }
+
+  const contentBlocks: AnthropicContentBlock[] = [];
+  let stopReason = "";
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  // Track content blocks being built
+  const blockIndex = new Map<number, AnthropicContentBlock>();
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body for streaming");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let currentEventType = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("event: ")) {
+        currentEventType = trimmed.slice(7).trim();
+        continue;
+      }
+      if (!trimmed.startsWith("data: ")) continue;
+      const jsonStr = trimmed.slice(6);
+      if (jsonStr === "[DONE]") continue;
+
+      let data: Record<string, unknown>;
+      try { data = JSON.parse(jsonStr) as Record<string, unknown>; } catch { continue; }
+
+      if (currentEventType === "message_start") {
+        const msg = data.message as Record<string, unknown> | undefined;
+        const usage = msg?.usage as { input_tokens?: number } | undefined;
+        if (usage?.input_tokens) inputTokens = usage.input_tokens;
+      } else if (currentEventType === "content_block_start") {
+        const idx = data.index as number;
+        const block = data.content_block as Record<string, unknown> | undefined;
+        if (block) {
+          const newBlock: AnthropicContentBlock = {
+            type: String(block.type ?? "text"),
+            ...(block.text !== undefined ? { text: String(block.text) } : {}),
+            ...(block.id !== undefined ? { id: String(block.id) } : {}),
+            ...(block.name !== undefined ? { name: String(block.name) } : {}),
+            ...(block.input !== undefined ? { input: block.input as Record<string, unknown> } : {})
+          };
+          blockIndex.set(idx, newBlock);
+        }
+      } else if (currentEventType === "content_block_delta") {
+        const idx = data.index as number;
+        const delta = data.delta as Record<string, unknown> | undefined;
+        const block = blockIndex.get(idx);
+        if (delta && block) {
+          if (delta.type === "text_delta" && typeof delta.text === "string") {
+            block.text = (block.text ?? "") + delta.text;
+            onDelta(delta.text);
+          } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+            // Tool input arrives as incremental JSON fragments
+            if (!block.input) block.input = {} as Record<string, unknown>;
+            (block as { _partialJson?: string })._partialJson =
+              ((block as { _partialJson?: string })._partialJson ?? "") + delta.partial_json;
+          }
+        }
+      } else if (currentEventType === "content_block_stop") {
+        const idx = data.index as number;
+        const block = blockIndex.get(idx);
+        if (block) {
+          // Parse accumulated partial JSON for tool_use blocks
+          if (block.type === "tool_use") {
+            const partialJson = (block as { _partialJson?: string })._partialJson;
+            if (partialJson) {
+              try { block.input = JSON.parse(partialJson) as Record<string, unknown>; } catch { /* keep empty */ }
+              delete (block as { _partialJson?: string })._partialJson;
+            }
+          }
+          contentBlocks.push(block);
+        }
+      } else if (currentEventType === "message_delta") {
+        const delta = data.delta as Record<string, unknown> | undefined;
+        if (delta?.stop_reason) stopReason = String(delta.stop_reason);
+        const usage = data.usage as { output_tokens?: number } | undefined;
+        if (usage?.output_tokens) outputTokens = usage.output_tokens;
+      }
+    }
+  }
+
+  return {
+    content: contentBlocks,
+    stop_reason: stopReason || "end_turn",
+    usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+  };
 }
 
 async function callOpenAiAgent(
@@ -368,8 +518,16 @@ async function callOpenAiAgent(
   model: string,
   messages: AgentMessage[],
   maxTokens: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  cacheTraceRunId?: string
 ): Promise<OpenAiResponse> {
+  const cacheKey = createPromptCacheKey("openai-compatible", model, "", messages, maxTokens);
+  const cached = await readPromptCache(cacheKey);
+  if (cached) {
+    if (cacheTraceRunId) await appendTrace(cacheTraceRunId, "execution.cache_hit", { key: cacheKey, provider: "openai" });
+    return cached as OpenAiResponse;
+  }
+  if (cacheTraceRunId) await appendTrace(cacheTraceRunId, "execution.cache_miss", { key: cacheKey, provider: "openai" });
   const body: Record<string, unknown> = {
     model,
     messages,
@@ -390,7 +548,137 @@ async function callOpenAiAgent(
     const text = await response.text();
     throw new Error(`OpenAI API error: ${response.status} ${text}`);
   }
-  return (await response.json()) as OpenAiResponse;
+  const parsed = (await response.json()) as OpenAiResponse;
+  await writePromptCache(cacheKey, parsed);
+  return parsed;
+}
+
+async function callOpenAiAgentStreaming(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  messages: AgentMessage[],
+  maxTokens: number,
+  onDelta: (text: string) => void,
+  signal?: AbortSignal,
+  tools?: unknown[]
+): Promise<OpenAiResponse> {
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    max_tokens: maxTokens,
+    temperature: 0.2,
+    tools: tools ?? OPENAI_TOOLS,
+    stream: true,
+    stream_options: { include_usage: true }
+  };
+  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    signal: signal ?? null,
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`OpenAI API error: ${response.status} ${text}`);
+  }
+
+  let contentText = "";
+  let finishReason = "";
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let totalTokens = 0;
+  const toolCalls = new Map<number, OpenAiToolCall>();
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body for streaming");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const jsonStr = trimmed.slice(6);
+      if (jsonStr === "[DONE]") continue;
+
+      let data: Record<string, unknown>;
+      try { data = JSON.parse(jsonStr) as Record<string, unknown>; } catch { continue; }
+
+      // Extract usage from final chunk
+      const usage = data.usage as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
+      if (usage) {
+        if (usage.prompt_tokens) promptTokens = usage.prompt_tokens;
+        if (usage.completion_tokens) completionTokens = usage.completion_tokens;
+        if (usage.total_tokens) totalTokens = usage.total_tokens;
+      }
+
+      const choices = data.choices as Array<{
+        delta?: { content?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> };
+        finish_reason?: string;
+      }> | undefined;
+      const choice = choices?.[0];
+      if (!choice) continue;
+
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+
+      const delta = choice.delta;
+      if (!delta) continue;
+
+      // Text content
+      if (delta.content) {
+        contentText += delta.content;
+        onDelta(delta.content);
+      }
+
+      // Tool calls — accumulated across chunks
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const existing = toolCalls.get(tc.index);
+          if (!existing) {
+            toolCalls.set(tc.index, {
+              id: tc.id ?? "",
+              type: "function",
+              function: {
+                name: tc.function?.name ?? "",
+                arguments: tc.function?.arguments ?? ""
+              }
+            });
+          } else {
+            if (tc.id) existing.id = tc.id;
+            if (tc.function?.name) existing.function.name = tc.function.name;
+            if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
+          }
+        }
+      }
+    }
+  }
+
+  const assembledToolCalls = [...toolCalls.values()];
+  return {
+    choices: [
+      {
+        message: {
+          role: "assistant",
+          content: contentText || null,
+          ...(assembledToolCalls.length > 0 ? { tool_calls: assembledToolCalls } : {})
+        },
+        finish_reason: finishReason || "stop"
+      }
+    ],
+    usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens }
+  };
 }
 
 // --- Core Agentic Execution ---
@@ -412,6 +700,12 @@ async function executeRun(
   });
 
   try {
+    const projectConfig = loadProjectConfig(input.directory);
+    await appendTrace(run.runId, "execution.project_config", {
+      hasConfig: projectConfig !== null,
+      toolAllowlist: projectConfig?.toolAllowlist ?? null,
+      contextBudgetTokens: projectConfig?.contextBudgetTokens ?? null
+    });
     // 1. Build context with hybrid-style selection + telemetry
     const context = buildLiveContext({
       directory: input.directory,
@@ -423,6 +717,15 @@ async function executeRun(
       telemetry: context.retrievalTelemetry
     });
     emitRunStatus(run.runId, "executing", "Prepared context for execution.", { type: "info" });
+
+    // 1b. Load MCP adapters from project config
+    if (projectConfig?.mcpServers && projectConfig.mcpServers.length > 0) {
+      await loadMcpAdaptersFromConfig(projectConfig.mcpServers, input.directory, run.runId);
+      emitRunStatus(run.runId, "executing", `Loaded ${projectConfig.mcpServers.length} MCP adapter(s).`, { type: "info" });
+    }
+    const mcpDefs = await collectMcpToolDefinitions();
+    const allAnthropicTools = [...ANTHROPIC_TOOLS, ...mcpDefs.anthropicTools];
+    const allOpenaiTools = [...OPENAI_TOOLS, ...mcpDefs.openaiTools];
 
     // 2. Resolve provider + API key
     const provider = (await requestJson(`/api/providers/${encodeURIComponent(input.providerId)}`)) as {
@@ -439,10 +742,14 @@ async function executeRun(
       routingMode?: "balanced" | "latency" | "quality" | "cost";
       egressPolicyMode?: "off" | "audit" | "enforce";
       egressAllowHosts?: string[];
+      contextHistoryMaxMessages?: number;
+      contextSummaryMaxChars?: number;
     };
-    const maxTokens = settingsData.maxTokens ?? 4096;
+    const maxTokens = projectConfig?.maxTokens ?? settingsData.maxTokens ?? 4096;
     const routingMode = settingsData.routingMode ?? "balanced";
-    const modelName = await selectModelByRouting(provider.defaultModel ?? "gpt-4o", routingMode, provider.id);
+    const modelName =
+      projectConfig?.preferredModel ??
+      (await selectModelByRouting(provider.defaultModel ?? "gpt-4o", routingMode, provider.id));
     const circuit = getCircuit(provider.id);
     const threadId = await ensureRunThread(run.runId, input.threadId);
     await saveExecutionState(requestJson, run.runId, {
@@ -461,10 +768,14 @@ CRITICAL: You MUST use your tools to actually build things. NEVER just describe 
 
 You have these tools:
 - write_file: Create/overwrite files (parent dirs created automatically)
+- edit_file: Apply targeted edits inside an existing file
 - read_file: Read existing file contents
+- search_code: Search for matching text in repository files
+- glob_files: Discover files by pattern
 - run_command: Execute shell commands (install deps, run scripts, test, etc.)
+- git_status/git_diff/git_add/git_commit: Guarded git workflow tools
 - list_directory: List directory contents
-
+${mcpDefs.toolMap.size > 0 ? `\nYou also have ${mcpDefs.toolMap.size} MCP tool(s) available from external servers. Use them when appropriate.\n` : ""}
 Working directory: ${input.directory}
 All file paths are relative to this directory. Write files DIRECTLY here — do NOT create a subdirectory with an arbitrary project name.
 
@@ -521,6 +832,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
       planText: planningText,
       planSteps
     });
+    await runHook(run.runId, "planning", { turn: 0, planSteps: planSteps.length }, projectConfig?.hooks, input.directory);
     await appendThreadMessage(threadId, "assistant", planningText, 0, { type: "plan" });
 
     await appendTrace(run.runId, "llm.request", {
@@ -549,13 +861,50 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
       }
       const turnNum = turn + 1;
       const turnStart = Date.now();
+      await compressMessagesWithLLM(
+        messages,
+        {
+          maxMessages: projectConfig?.contextHistoryMaxMessages ?? settingsData.contextHistoryMaxMessages ?? 28,
+          summaryMaxChars: projectConfig?.contextSummaryMaxChars ?? settingsData.contextSummaryMaxChars ?? 2400
+        },
+        async (prompt) => {
+          if (provider.kind === "anthropic-compatible") {
+            const resp = await callAnthropicAgent(provider.baseUrl, apiKey, modelName, prompt, [{ role: "user", content: "Summarize." }], 512, controller.signal);
+            return resp.content?.find((b) => b.type === "text")?.text ?? "";
+          }
+          const resp = await callOpenAiAgent(provider.baseUrl, apiKey, modelName, [{ role: "system", content: prompt }, { role: "user", content: "Summarize." }], 512, controller.signal);
+          return resp.choices?.[0]?.message?.content ?? "";
+        }
+      );
 
       if (provider.kind === "anthropic-compatible") {
-        // --- Anthropic agentic turn ---
+        // --- Anthropic agentic turn (with real streaming) ---
         const response = await withRetry(
           async () => {
             guardCircuit(circuit, Date.now());
-            const value = await callAnthropicAgent(provider.baseUrl, apiKey, modelName, systemPrompt, messages, maxTokens, controller.signal);
+            // Check prompt cache first for a non-streaming hit
+            const cacheKey = createPromptCacheKey("anthropic-compatible", modelName, systemPrompt, messages, maxTokens);
+            const cached = await readPromptCache(cacheKey);
+            if (cached) {
+              await appendTrace(run.runId, "execution.cache_hit", { key: cacheKey, provider: "anthropic" });
+              recordCircuitSuccess(circuit);
+              return cached as AnthropicResponse;
+            }
+            await appendTrace(run.runId, "execution.cache_miss", { key: cacheKey, provider: "anthropic" });
+            const value = await callAnthropicAgentStreaming(
+              provider.baseUrl,
+              apiKey,
+              modelName,
+              systemPrompt,
+              messages,
+              maxTokens,
+              (delta) => {
+                emitRunStatus(run.runId, "executing", delta, { type: "llm_delta", turn: turnNum, detail: delta });
+              },
+              controller.signal,
+              allAnthropicTools
+            );
+            await writePromptCache(cacheKey, value);
             recordCircuitSuccess(circuit);
             return value;
           },
@@ -638,6 +987,9 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
             const toolStart = Date.now();
             let result: string;
             try {
+              if (Array.isArray(projectConfig?.toolAllowlist) && !projectConfig.toolAllowlist.includes(toolName)) {
+                throw new Error(`Tool disallowed by project config: ${toolName}`);
+              }
               if (toolName === "run_command") {
                 const inspection = inspectCommand(String(toolInput.command ?? ""));
                 await appendTrace(run.runId, "execution.command_inspection", {
@@ -693,8 +1045,14 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                   throw new Error(`Tool rejected by operator: ${toolName}`);
                 }
               }
+              const mcpMapping = mcpDefs.toolMap.get(toolName);
               result = await withRetry(
-                async () => executeTool(toolName, toolInput, input.directory),
+                async () => {
+                  if (mcpMapping) {
+                    return executeMcpTool(mcpMapping.adapterId, mcpMapping.toolName, toolInput);
+                  }
+                  return executeToolAsync(toolName, toolInput, input.directory, controller.signal);
+                },
                 retryPolicyFor("tool", "tool"),
                 async (attempt, error) => {
                   retryCount += 1;
@@ -708,7 +1066,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                 }
               );
               const validation = validateToolOutcome({
-                toolName,
+                toolName: mcpMapping ? mcpMapping.toolName : toolName,
                 toolInput,
                 toolResult: result,
                 projectDir: input.directory
@@ -738,6 +1096,11 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                 validationFailures += 1;
               }
               actionCount++;
+              await runHook(run.runId, "tool_result", {
+                turn: turnNum,
+                tool: toolName,
+                ok: !result.startsWith("Error:")
+              }, projectConfig?.hooks, input.directory);
             } catch (err) {
               result = `Error: ${err instanceof Error ? err.message : "Unknown error"}`;
             }
@@ -791,11 +1154,32 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
           break;
         }
       } else {
-        // --- OpenAI-compatible agentic turn ---
+        // --- OpenAI-compatible agentic turn (with real streaming) ---
         const response = await withRetry(
           async () => {
             guardCircuit(circuit, Date.now());
-            const value = await callOpenAiAgent(provider.baseUrl, apiKey, modelName, messages, maxTokens, controller.signal);
+            // Check prompt cache first for a non-streaming hit
+            const cacheKey = createPromptCacheKey("openai-compatible", modelName, "", messages, maxTokens);
+            const cached = await readPromptCache(cacheKey);
+            if (cached) {
+              await appendTrace(run.runId, "execution.cache_hit", { key: cacheKey, provider: "openai" });
+              recordCircuitSuccess(circuit);
+              return cached as OpenAiResponse;
+            }
+            await appendTrace(run.runId, "execution.cache_miss", { key: cacheKey, provider: "openai" });
+            const value = await callOpenAiAgentStreaming(
+              provider.baseUrl,
+              apiKey,
+              modelName,
+              messages,
+              maxTokens,
+              (delta) => {
+                emitRunStatus(run.runId, "executing", delta, { type: "llm_delta", turn: turnNum, detail: delta });
+              },
+              controller.signal,
+              allOpenaiTools
+            );
+            await writePromptCache(cacheKey, value);
             recordCircuitSuccess(circuit);
             return value;
           },
@@ -840,9 +1224,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
         if (assistantMessage?.content) {
           allTextResponses.push(assistantMessage.content);
           await appendThreadMessage(threadId, "assistant", assistantMessage.content, turnNum);
-          emitRunStatus(run.runId, "executing", assistantMessage.content.slice(0, 500), {
-            type: "llm_text", turn: turnNum, detail: assistantMessage.content
-          });
+          emitRunStatus(run.runId, "executing", assistantMessage.content.slice(0, 500), { type: "llm_text", turn: turnNum, detail: assistantMessage.content });
           await appendTrace(run.runId, "llm.text", { text: assistantMessage.content, turn: turnNum });
         }
 
@@ -892,6 +1274,9 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
             const toolStart = Date.now();
             let result: string;
             try {
+              if (Array.isArray(projectConfig?.toolAllowlist) && !projectConfig.toolAllowlist.includes(tc.function.name)) {
+                throw new Error(`Tool disallowed by project config: ${tc.function.name}`);
+              }
               if (tc.function.name === "run_command") {
                 const inspection = inspectCommand(String(toolInput.command ?? ""));
                 await appendTrace(run.runId, "execution.command_inspection", {
@@ -961,8 +1346,14 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                   throw new Error(`Tool rejected by operator: ${tc.function.name}`);
                 }
               }
+              const mcpMappingOai = mcpDefs.toolMap.get(tc.function.name);
               result = await withRetry(
-                async () => executeTool(tc.function.name, toolInput, input.directory),
+                async () => {
+                  if (mcpMappingOai) {
+                    return executeMcpTool(mcpMappingOai.adapterId, mcpMappingOai.toolName, toolInput);
+                  }
+                  return executeToolAsync(tc.function.name, toolInput, input.directory, controller.signal);
+                },
                 retryPolicyFor("tool", "tool"),
                 async (attempt, error) => {
                   retryCount += 1;
@@ -976,7 +1367,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                 }
               );
               const validation = validateToolOutcome({
-                toolName: tc.function.name,
+                toolName: mcpMappingOai ? mcpMappingOai.toolName : tc.function.name,
                 toolInput,
                 toolResult: result,
                 projectDir: input.directory
@@ -1006,6 +1397,11 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
                 validationFailures += 1;
               }
               actionCount++;
+              await runHook(run.runId, "tool_result", {
+                turn: turnNum,
+                tool: tc.function.name,
+                ok: !result.startsWith("Error:")
+              }, projectConfig?.hooks, input.directory);
             } catch (err) {
               result = `Error: ${err instanceof Error ? err.message : "Unknown error"}`;
             }
@@ -1073,6 +1469,7 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
       reflectionNotes
     });
     await appendTrace(run.runId, "execution.reflection", { reflectionText, reflectionNotes });
+    await runHook(run.runId, "reflection", { notes: reflectionNotes.length }, projectConfig?.hooks, input.directory);
     await appendThreadMessage(threadId, "assistant", reflectionText, MAX_AGENT_TURNS + 1, { type: "reflection" });
 
     // 6. Finalize
@@ -1166,6 +1563,13 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
       }
     });
     await clearExecutionState(requestJson, run.runId);
+    await runHook(run.runId, "on_complete", {
+      actionCount,
+      turns: turnsUsed,
+      totalInputTokens,
+      totalOutputTokens,
+      duration: totalDuration
+    }, projectConfig?.hooks, input.directory);
     lifecycle.transition("idle");
     activeRunControllers.delete(run.runId);
     return { run, execution: { status: "executed", reason: finalResponse } };
@@ -1217,7 +1621,14 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
 function describeToolCall(name: string, input: Record<string, unknown>): string {
   switch (name) {
     case "write_file": return `Writing file: ${input.path ?? "unknown"}`;
+    case "edit_file": return `Editing file: ${input.path ?? "unknown"}`;
     case "read_file": return `Reading file: ${input.path ?? "unknown"}`;
+    case "search_code": return `Searching code: ${input.query ?? ""}`;
+    case "glob_files": return `Globbing files: ${input.pattern ?? "*"}`;
+    case "git_status": return "Checking git status";
+    case "git_diff": return `Checking git diff${input.staged === true ? " (staged)" : ""}`;
+    case "git_add": return `Staging: ${input.pathspec ?? ""}`;
+    case "git_commit": return "Creating commit";
     case "run_command": return `Running: ${input.command ?? "unknown"}`;
     case "list_directory": return `Listing: ${input.path ?? "."}`;
     default: return `Calling ${name}`;
@@ -1315,11 +1726,313 @@ async function recordModelPerformance(input: {
 function describeToolInput(name: string, input: Record<string, unknown>): string {
   switch (name) {
     case "write_file": return String(input.path ?? "");
+    case "edit_file": return String(input.path ?? "");
     case "read_file": return String(input.path ?? "");
+    case "search_code": return String(input.query ?? "").slice(0, 120);
+    case "glob_files": return String(input.pattern ?? "");
+    case "git_status": return "";
+    case "git_diff": return input.staged === true ? "--staged" : "";
+    case "git_add": return String(input.pathspec ?? "");
+    case "git_commit": return "message=<provided>";
     case "run_command": return String(input.command ?? "").slice(0, 120);
     case "list_directory": return String(input.path ?? ".");
     default: return JSON.stringify(input).slice(0, 100);
   }
+}
+
+interface ProjectAgentConfig {
+  toolAllowlist?: string[];
+  preferredModel?: string;
+  maxTokens?: number;
+  contextHistoryMaxMessages?: number;
+  contextSummaryMaxChars?: number;
+  contextBudgetTokens?: number;
+  hooks?: HookConfig;
+  mcpServers?: Array<{
+    id: string;
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+  }>;
+}
+
+function loadProjectConfig(projectDir: string): ProjectAgentConfig | null {
+  const configPath = path.join(projectDir, ".autoagent.json");
+  try {
+    const raw = readFileSync(configPath, "utf8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const config: ProjectAgentConfig = {
+      ...(Array.isArray(parsed.toolAllowlist)
+        ? { toolAllowlist: parsed.toolAllowlist.filter((v): v is string => typeof v === "string") }
+        : {}),
+      ...(typeof parsed.preferredModel === "string" ? { preferredModel: parsed.preferredModel } : {}),
+      ...(typeof parsed.maxTokens === "number" ? { maxTokens: parsed.maxTokens } : {}),
+      ...(typeof parsed.contextHistoryMaxMessages === "number"
+        ? { contextHistoryMaxMessages: parsed.contextHistoryMaxMessages }
+        : {}),
+      ...(typeof parsed.contextSummaryMaxChars === "number"
+        ? { contextSummaryMaxChars: parsed.contextSummaryMaxChars }
+        : {}),
+      ...(isRecord(parsed.hooks) ? { hooks: parseHookConfig(parsed.hooks) } : {})
+    };
+    if (Array.isArray(parsed.mcpServers)) {
+      const servers = parseMcpServersConfig(parsed.mcpServers);
+      if (servers.length > 0) config.mcpServers = servers;
+    }
+    return config;
+  } catch {
+    return null;
+  }
+}
+
+function parseHookConfig(raw: Record<string, unknown>): HookConfig {
+  const config: HookConfig = {};
+  for (const key of ["planning", "tool_result", "reflection", "on_complete"] as const) {
+    if (typeof raw[key] === "string") config[key] = raw[key] as string;
+  }
+  return config;
+}
+
+function parseMcpServersConfig(raw: unknown[]): NonNullable<ProjectAgentConfig["mcpServers"]> {
+  return raw
+    .filter(isRecord)
+    .filter((entry) => typeof entry.id === "string" && typeof entry.command === "string")
+    .map((entry) => ({
+      id: String(entry.id),
+      command: String(entry.command),
+      ...(Array.isArray(entry.args) ? { args: entry.args.filter((a): a is string => typeof a === "string") } : {}),
+      ...(isRecord(entry.env)
+        ? {
+            env: Object.fromEntries(
+              Object.entries(entry.env as Record<string, unknown>).filter(([, v]) => typeof v === "string")
+            ) as Record<string, string>
+          }
+        : {})
+    }));
+}
+
+/**
+ * Create a stdio-based MCP adapter from a command config.
+ * Spawns the MCP server process and communicates via JSON-RPC over stdin/stdout.
+ */
+function createStdioMcpAdapter(config: {
+  id: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}, projectDir: string): RegisteredMcpAdapter {
+  let childProcess: ReturnType<typeof spawn> | null = null;
+  let requestId = 0;
+  const pendingRequests = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
+  function ensureProcess(): ReturnType<typeof spawn> {
+    if (childProcess && !childProcess.killed) return childProcess;
+    const args = config.args ?? [];
+    childProcess = spawn(config.command, args, {
+      cwd: projectDir,
+      shell: true,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, ...(config.env ?? {}) }
+    });
+    let buffer = "";
+    childProcess.stdout!.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line) as { id?: number; result?: unknown; error?: { message?: string } };
+          if (msg.id !== undefined) {
+            const pending = pendingRequests.get(msg.id);
+            if (pending) {
+              pendingRequests.delete(msg.id);
+              if (msg.error) pending.reject(new Error(msg.error.message ?? "MCP error"));
+              else pending.resolve(msg.result);
+            }
+          }
+        } catch { /* ignore non-JSON lines */ }
+      }
+    });
+    childProcess.on("error", () => {
+      for (const p of pendingRequests.values()) p.reject(new Error("MCP process error"));
+      pendingRequests.clear();
+    });
+    childProcess.on("close", () => {
+      for (const p of pendingRequests.values()) p.reject(new Error("MCP process exited"));
+      pendingRequests.clear();
+      childProcess = null;
+    });
+    return childProcess;
+  }
+
+  function sendRequest(method: string, params?: Record<string, unknown>): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const id = ++requestId;
+      const proc = ensureProcess();
+      pendingRequests.set(id, { resolve, reject });
+      const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
+      proc.stdin!.write(msg + "\n");
+      setTimeout(() => {
+        if (pendingRequests.has(id)) {
+          pendingRequests.delete(id);
+          reject(new Error("MCP request timed out"));
+        }
+      }, 15_000);
+    });
+  }
+
+  return {
+    id: config.id,
+    async listTools() {
+      const result = await sendRequest("tools/list") as { tools?: Array<{ name: string; description: string; inputSchema?: Record<string, unknown> }> };
+      return (result?.tools ?? []).map((t) => ({
+        name: t.name,
+        description: t.description ?? "",
+        inputSchema: t.inputSchema ?? { type: "object", properties: {} }
+      }));
+    },
+    async invokeTool(name: string, input: Record<string, unknown>) {
+      const result = await sendRequest("tools/call", { name, arguments: input }) as { content?: Array<{ text?: string }>; isError?: boolean };
+      const text = result?.content?.map((c) => c.text ?? "").join("") ?? "";
+      return { ok: !result?.isError, output: text };
+    }
+  };
+}
+
+async function loadMcpAdaptersFromConfig(
+  mcpServers: NonNullable<ProjectAgentConfig["mcpServers"]>,
+  projectDir: string,
+  runId: string
+): Promise<void> {
+  clearMcpAdapters();
+  for (const server of mcpServers) {
+    try {
+      const adapter = createStdioMcpAdapter(server, projectDir);
+      registerMcpAdapter(adapter);
+      await appendTrace(runId, "mcp.adapter_registered", { id: server.id, command: server.command });
+    } catch {
+      await appendTrace(runId, "mcp.adapter_failed", { id: server.id }).catch(() => undefined);
+    }
+  }
+}
+
+async function compressMessagesWithLLM(
+  messages: AgentMessage[],
+  input: { maxMessages: number; summaryMaxChars: number },
+  llmCall: (prompt: string) => Promise<string>
+): Promise<void> {
+  if (messages.length <= input.maxMessages) return;
+  const head = messages[0];
+  if (!head) return;
+  const keepCount = Math.max(6, Math.floor(input.maxMessages / 2));
+  const tail = messages.slice(-keepCount);
+  const compressible = messages.slice(1, Math.max(1, messages.length - tail.length));
+  if (compressible.length === 0) return;
+
+  const transcript = compressible
+    .map((msg) => {
+      if (msg.role === "tool") return `[tool_result] ${msg.content.slice(0, 800)}`;
+      if (typeof msg.content === "string") return `[${msg.role}] ${msg.content.slice(0, 800)}`;
+      return `[${msg.role}] <structured content>`;
+    })
+    .join("\n---\n")
+    .slice(0, 6000);
+
+  const summaryPrompt = `Summarize this conversation history for an AI coding agent. Preserve: key decisions made, files created/modified, commands run and their outcomes, errors encountered, and current progress. Be concise but don't lose critical details.\n\n${transcript}`;
+
+  let summary: string;
+  try {
+    summary = await llmCall(summaryPrompt);
+  } catch {
+    // Fallback to truncation if LLM call fails
+    summary = compressible
+      .map((msg) => {
+        if (msg.role === "tool") return `[tool] ${msg.content.slice(0, 220)}`;
+        if (typeof msg.content === "string") return `[${msg.role}] ${msg.content.slice(0, 220)}`;
+        return `[${msg.role}] complex-content`;
+      })
+      .join("\n")
+      .slice(0, input.summaryMaxChars);
+  }
+
+  const summaryMessage: AgentMessage = {
+    role: "system",
+    content: `Compressed conversation summary:\n${summary}`
+  };
+  messages.splice(0, messages.length, head, summaryMessage, ...tail);
+}
+
+
+
+type HookEvent = "planning" | "tool_result" | "reflection" | "on_complete";
+type HookConfig = Partial<Record<HookEvent, string>>;
+
+async function runHook(
+  runId: string,
+  event: HookEvent,
+  payload: Record<string, unknown>,
+  hookConfig?: HookConfig,
+  projectDir?: string
+): Promise<void> {
+  await appendTrace(runId, `hook.${event}`, payload).catch(() => undefined);
+
+  const command = hookConfig?.[event];
+  if (!command || !projectDir) return;
+
+  try {
+    const child = spawn(command, {
+      cwd: projectDir,
+      shell: true,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    const hookPayload = JSON.stringify({ runId, event, timestamp: new Date().toISOString(), ...payload });
+    child.stdin.write(hookPayload);
+    child.stdin.end();
+    const killTimer = setTimeout(() => child.kill("SIGTERM"), 10_000);
+    child.on("close", () => clearTimeout(killTimer));
+    child.on("error", (err) => {
+      clearTimeout(killTimer);
+      appendTrace(runId, `hook.${event}.error`, { error: err.message }).catch(() => undefined);
+    });
+  } catch {
+    // Hook execution is best-effort
+  }
+}
+
+function createPromptCacheKey(
+  providerKind: "openai-compatible" | "anthropic-compatible" | "custom",
+  model: string,
+  system: string,
+  messages: AgentMessage[],
+  maxTokens: number
+): string {
+  const raw = stableStringify({
+    providerKind,
+    model,
+    system,
+    maxTokens,
+    messages
+  });
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+async function readPromptCache(key: string): Promise<unknown | null> {
+  const result = (await requestJson(`/api/prompt-cache/${encodeURIComponent(key)}`).catch(() => null)) as
+    | { hit?: boolean; value?: unknown; createdAt?: string }
+    | null;
+  if (!result?.hit || !result.createdAt) return null;
+  const age = Date.now() - Date.parse(result.createdAt);
+  if (age > PROMPT_CACHE_TTL_MS) return null;
+  return result.value ?? null;
+}
+
+async function writePromptCache(key: string, value: unknown): Promise<void> {
+  await requestJson(`/api/prompt-cache/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ value })
+  }).catch(() => undefined);
 }
 
 ipcMain.handle(IPC_CHANNELS.runStart, async (_event, input: StartRunInput) => {

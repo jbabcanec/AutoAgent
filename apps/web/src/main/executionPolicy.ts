@@ -37,9 +37,10 @@ export function evaluateToolPolicy(context: ToolPolicyContext): ToolPolicyResult
 }
 
 function classifyActionClass(toolName: string, input: Record<string, unknown>): ActionClass {
-  if (toolName === "read_file" || toolName === "list_directory") return "read";
+  if (toolName === "read_file" || toolName === "list_directory" || toolName === "search_code" || toolName === "glob_files") return "read";
   if (toolName === "ask_user") return "read";
-  if (toolName === "write_file") return "write";
+  if (toolName === "write_file" || toolName === "edit_file" || toolName === "git_add" || toolName === "git_commit") return "write";
+  if (toolName === "git_status" || toolName === "git_diff") return "read";
   if (toolName === "run_command") {
     const command = String(input.command ?? "").toLowerCase();
     if (command.includes("deploy") || command.includes("kubectl apply")) return "deploy";
@@ -50,13 +51,22 @@ function classifyActionClass(toolName: string, input: Record<string, unknown>): 
 }
 
 function classifyRisk(toolName: string, input: Record<string, unknown>): RiskLevel {
-  if (toolName === "read_file" || toolName === "list_directory") return "low";
+  if (
+    toolName === "read_file" ||
+    toolName === "list_directory" ||
+    toolName === "search_code" ||
+    toolName === "glob_files" ||
+    toolName === "git_status" ||
+    toolName === "git_diff"
+  ) return "low";
   if (toolName === "ask_user") return "low";
-  if (toolName === "write_file") {
+  if (toolName === "write_file" || toolName === "edit_file") {
     const pathValue = String(input.path ?? "").toLowerCase();
     if (pathValue.endsWith(".env") || pathValue.includes("secrets")) return "critical";
     return "medium";
   }
+  if (toolName === "git_add") return "medium";
+  if (toolName === "git_commit") return "high";
   const command = String(input.command ?? "").toLowerCase();
   if (!command) return "medium";
   if (command.includes("rm -rf") || command.includes("format") || command.includes("drop database")) return "critical";
