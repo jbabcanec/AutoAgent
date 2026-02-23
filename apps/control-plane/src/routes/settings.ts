@@ -1,4 +1,5 @@
 import type { RouteContext, RouteResult } from "./routeTypes.js";
+import type { SettingsItem } from "../types.js";
 
 export function handleSettingsRoute(
   pathname: string,
@@ -12,11 +13,43 @@ export function handleSettingsRoute(
 
   if (pathname === "/api/settings" && method === "PUT") {
     const payload = isRecord(body) ? body : {};
-    const requireApproval = payload.requireApproval;
-    if (typeof requireApproval !== "boolean") {
-      return { status: 400, body: { error: "requireApproval must be boolean" } };
+    const updates: Partial<SettingsItem> = {};
+    if (typeof payload.requireApproval === "boolean") updates.requireApproval = payload.requireApproval;
+    if (typeof payload.hasCompletedOnboarding === "boolean") {
+      updates.hasCompletedOnboarding = payload.hasCompletedOnboarding;
     }
-    return { status: 200, body: ctx.settings.update({ requireApproval }) };
+    if (
+      payload.trialTaskCompleted === "chat" ||
+      payload.trialTaskCompleted === "repo" ||
+      payload.trialTaskCompleted === "both" ||
+      payload.trialTaskCompleted === "none"
+    ) {
+      updates.trialTaskCompleted = payload.trialTaskCompleted;
+    }
+    if (typeof payload.onboardingCompletedAt === "string") {
+      updates.onboardingCompletedAt = payload.onboardingCompletedAt;
+    }
+    if (typeof payload.maxTokens === "number" && payload.maxTokens > 0) {
+      updates.maxTokens = payload.maxTokens;
+    }
+    if (
+      payload.routingMode === "balanced" ||
+      payload.routingMode === "latency" ||
+      payload.routingMode === "quality" ||
+      payload.routingMode === "cost"
+    ) {
+      updates.routingMode = payload.routingMode;
+    }
+    if (payload.egressPolicyMode === "off" || payload.egressPolicyMode === "audit" || payload.egressPolicyMode === "enforce") {
+      updates.egressPolicyMode = payload.egressPolicyMode;
+    }
+    if (Array.isArray(payload.egressAllowHosts)) {
+      updates.egressAllowHosts = payload.egressAllowHosts.filter((value): value is string => typeof value === "string");
+    }
+    return {
+      status: 200,
+      body: ctx.settings.update(updates)
+    };
   }
 
   return undefined;

@@ -49,6 +49,25 @@ export class RunStore {
     };
   }
 
+  public updateStatus(runId: string, status: RunItem["status"], summary?: string): void {
+    const now = new Date().toISOString();
+    if (summary !== undefined) {
+      this.db
+        .prepare("UPDATE runs SET status = ?, summary = ?, updated_at = ? WHERE run_id = ?")
+        .run(status, summary, now, runId);
+    } else {
+      this.db
+        .prepare("UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?")
+        .run(status, now, runId);
+    }
+  }
+
+  public delete(runId: string): boolean {
+    const result = this.db.prepare("DELETE FROM runs WHERE run_id = ?").run(runId);
+    this.db.prepare("DELETE FROM traces WHERE run_id = ?").run(runId);
+    return result.changes > 0;
+  }
+
   public create(input: Pick<RunItem, "projectId"> & { objective: string }): RunItem {
     const runId = `run-${Date.now()}`;
     const now = new Date().toISOString();

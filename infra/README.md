@@ -1,14 +1,14 @@
 # Infrastructure
 
-This directory contains reference deployment configurations for both self-hosted and managed cloud modes.
+This directory contains reference deployment configurations for control-plane and runner services.
 
 ## Self-hosted
 
 - Compose stack: `infra/self-hosted/docker-compose.yml`
-- Runs control-plane, runner, and web with guarded execution defaults enabled.
+- Runs control-plane and runner with guarded execution defaults enabled.
 
 ## Cloud
 
 - Kubernetes manifests: `infra/cloud/k8s`
 - Terraform bootstrap placeholder: `infra/cloud/terraform/main.tf`
-- Uses the same service split as self-hosted for compatibility parity.
+- Desktop UI is distributed as an Electron app, not a cloud web service.

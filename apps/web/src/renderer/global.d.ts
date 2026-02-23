@@ -1,4 +1,4 @@
-import type { DesktopApi } from "./preload.js";
+import type { DesktopApi } from "../shared/ipc.js";
 
 declare global {
   interface Window {

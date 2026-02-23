@@ -22,14 +22,3 @@ services:
     environment:
       - AUTOAGENT_SANDBOX_MODE=container
       - AUTOAGENT_REQUIRE_APPROVAL=true
-
-  web:
-    image: node:22
-    working_dir: /workspace/apps/web
-    command: ["node", "src/index.ts"]
-    volumes:
-      - ../../:/workspace
-    environment:
-      - AUTOAGENT_API_URL=http://control-plane:8080
-    ports:
-      - "3000:3000"

@@ -13,6 +13,11 @@ export interface ApprovalItem {
   reason: string;
   requestedAt: string;
   status: "pending" | "approved" | "rejected";
+  scope?: "run" | "tool";
+  toolName?: string;
+  toolInput?: Record<string, unknown>;
+  expiresAt?: string;
+  contextHash?: string;
 }
 
 export interface ProviderItem {
@@ -21,6 +26,7 @@ export interface ProviderItem {
   kind: "openai-compatible" | "anthropic-compatible" | "custom";
   baseUrl: string;
   defaultModel?: string;
+  apiKeyStored: boolean;
 }
 
 export interface DashboardStats {
@@ -40,4 +46,11 @@ export interface TraceItem {
 
 export interface SettingsItem {
   requireApproval: boolean;
+  hasCompletedOnboarding: boolean;
+  trialTaskCompleted: "chat" | "repo" | "both" | "none";
+  onboardingCompletedAt?: string;
+  maxTokens: number;
+  routingMode?: "balanced" | "latency" | "quality" | "cost";
+  egressPolicyMode?: "off" | "audit" | "enforce";
+  egressAllowHosts?: string[];
 }

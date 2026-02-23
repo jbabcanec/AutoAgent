@@ -15,6 +15,7 @@ export interface CompletionRequest {
   temperature?: number;
   maxOutputTokens?: number;
   metadata?: Record<string, string>;
+  routingMode?: "balanced" | "latency" | "quality" | "cost";
 }
 
 export interface CompletionResult {
@@ -23,6 +24,8 @@ export interface CompletionResult {
   latencyMs: number;
   inputTokens?: number;
   outputTokens?: number;
+  estimatedCostUsd?: number;
+  selectedModel?: string;
   raw: unknown;
 }
 

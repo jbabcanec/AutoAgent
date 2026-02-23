@@ -2,12 +2,16 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { URL } from "node:url";
 import { handleApprovalsRoute } from "./routes/approvals.js";
 import { handleDashboardRoute } from "./routes/dashboard.js";
+import { handleExecutionStateRoute } from "./routes/executionState.js";
+import { handleModelPerformanceRoute } from "./routes/modelPerformance.js";
 import { handleProvidersRoute } from "./routes/providers.js";
 import { handleRunsRoute } from "./routes/runs.js";
 import { handleSettingsRoute } from "./routes/settings.js";
 import { handleTracesRoute } from "./routes/traces.js";
 import type { RouteContext, RouteResult } from "./routes/routeTypes.js";
 import { ApprovalStore } from "./stores/approvalStore.js";
+import { ExecutionStateStore } from "./stores/executionStateStore.js";
+import { ModelPerformanceStore } from "./stores/modelPerformanceStore.js";
 import { ProviderStore } from "./stores/providerStore.js";
 import { RunStore } from "./stores/runStore.js";
 import { SettingsStore } from "./stores/settingsStore.js";
@@ -16,16 +20,12 @@ import { TraceStore } from "./stores/traceStore.js";
 const ctx: RouteContext = {
   runs: new RunStore(),
   approvals: new ApprovalStore(),
+  executionState: new ExecutionStateStore(),
   traces: new TraceStore(),
   providers: new ProviderStore(),
-  settings: new SettingsStore()
+  settings: new SettingsStore(),
+  modelPerformance: new ModelPerformanceStore()
 };
-
-function setCors(res: ServerResponse): void {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.statusCode = status;
@@ -52,19 +52,15 @@ function route(pathname: string, method: string, body: unknown): RouteResult | u
     handleDashboardRoute(pathname, method, ctx) ??
     handleRunsRoute(pathname, method, body, ctx) ??
     handleApprovalsRoute(pathname, method, body, ctx) ??
-    handleTracesRoute(pathname, method, ctx) ??
+    handleExecutionStateRoute(pathname, method, body, ctx) ??
+    handleModelPerformanceRoute(pathname, method, body, ctx) ??
+    handleTracesRoute(pathname, method, body, ctx) ??
     handleSettingsRoute(pathname, method, body, ctx) ??
-    handleProvidersRoute(pathname, method, ctx)
+    handleProvidersRoute(pathname, method, body, ctx)
   );
 }
 
 const server = createServer(async (req, res) => {
-  setCors(res);
-  if (req.method === "OPTIONS") {
-    sendJson(res, 200, { ok: true });
-    return;
-  }
-
   const requestUrl = new URL(req.url ?? "/", "http://localhost:8080");
   const method = req.method ?? "GET";
   const body = await readBody(req);

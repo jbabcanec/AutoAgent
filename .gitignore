@@ -1,8 +1,12 @@
 node_modules/
 dist/
+dist-main/
+dist-renderer/
 .env
 .env.*
 coverage/
 *.log
 .DS_Store
 Thumbs.db
+test_dir/
+*.tsbuildinfo

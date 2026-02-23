@@ -8,13 +8,13 @@ AutoAgent is an open-source, provider-agnostic developer agent platform with gua
 - Policy-gated tool execution for safer autonomy
 - Repo-aware context compiler and history selection
 - Evaluation-driven optimization for quality, cost, and safety
-- Self-hosted and cloud deployment references
+- Desktop-first Electron operation with local control-plane services
 
 ## Monorepo
 
 - `apps/control-plane`: API orchestration and run lifecycle
 - `apps/runner`: sandboxed execution worker
-- `apps/web`: lightweight UI shell
+- `apps/web`: desktop Electron app (Vite + React renderer)
 - `packages/protocol`: typed platform contracts
 - `packages/provider-sdk`: provider abstraction layer
 - `packages/context-engine`: context compilation pipeline
@@ -31,9 +31,20 @@ AutoAgent is an open-source, provider-agnostic developer agent platform with gua
    - `pnpm --filter @autoagent/control-plane dev`
 3. Start desktop app:
    - `pnpm --filter @autoagent/web dev`
-4. In the Electron window, navigate:
+4. On first launch, complete onboarding:
+   - configure `openai-compatible` provider metadata
+   - save ChatGPT key securely
+   - run chat + repo trial steps
+5. In the Electron window, navigate:
    - Dashboard, Runs, Approvals, Traces, Settings, Providers
-5. Click `Play` from Dashboard to run a guarded execution test.
+6. Click `Play` from Dashboard to run a guarded execution test.
+
+## Packaging
+
+- Build desktop binaries:
+  - `pnpm --filter @autoagent/web dist`
+- Build unpacked app directory:
+  - `pnpm --filter @autoagent/web package`
 
 ## API smoke examples
 
@@ -47,6 +58,8 @@ AutoAgent is an open-source, provider-agnostic developer agent platform with gua
   - `curl http://localhost:8080/api/approvals`
 - Providers list:
   - `curl http://localhost:8080/api/providers`
+- Provider get:
+  - `curl http://localhost:8080/api/providers/openai-default`
 
 ## Persistence
 

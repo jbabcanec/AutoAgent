@@ -26,6 +26,24 @@ export function handleRunsRoute(
     return { status: 200, body: run };
   }
 
+  if (pathname.startsWith("/api/runs/") && method === "PUT") {
+    const runId = pathname.replace("/api/runs/", "");
+    const run = ctx.runs.get(runId);
+    if (!run) return { status: 404, body: { error: "Run not found" } };
+    const payload = isRecord(body) ? body : {};
+    const status = typeof payload.status === "string" ? payload.status as typeof run.status : run.status;
+    const summary = typeof payload.summary === "string" ? payload.summary : undefined;
+    ctx.runs.updateStatus(runId, status, summary);
+    return { status: 200, body: ctx.runs.get(runId) };
+  }
+
+  if (pathname.startsWith("/api/runs/") && method === "DELETE") {
+    const runId = pathname.replace("/api/runs/", "");
+    const deleted = ctx.runs.delete(runId);
+    if (!deleted) return { status: 404, body: { error: "Run not found" } };
+    return { status: 200, body: { deleted: true } };
+  }
+
   return undefined;
 }
 
