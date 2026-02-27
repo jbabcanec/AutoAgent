@@ -14,6 +14,8 @@ export function getControlPlaneDatabase(): Database.Database {
   const dbPath = process.env.AUTOAGENT_CONTROL_DB_PATH ?? path.join(dataDir, "control-plane.db");
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
+  db.pragma("wal_autocheckpoint = 1000");
+  try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* ok if WAL is empty */ }
   ensureSchema(db);
   seedData(db);
   instance = db;

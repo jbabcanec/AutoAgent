@@ -21,6 +21,7 @@ export function handleRunsRoute(
 
   if (pathname.startsWith("/api/runs/") && method === "GET") {
     const runId = pathname.replace("/api/runs/", "");
+    if (runId.includes("/")) return undefined;
     const run = ctx.runs.get(runId);
     if (!run) return { status: 404, body: { error: "Run not found" } };
     return { status: 200, body: run };
@@ -28,6 +29,7 @@ export function handleRunsRoute(
 
   if (pathname.startsWith("/api/runs/") && method === "PUT") {
     const runId = pathname.replace("/api/runs/", "");
+    if (runId.includes("/")) return undefined;
     const run = ctx.runs.get(runId);
     if (!run) return { status: 404, body: { error: "Run not found" } };
     const payload = isRecord(body) ? body : {};
@@ -39,6 +41,7 @@ export function handleRunsRoute(
 
   if (pathname.startsWith("/api/runs/") && method === "DELETE") {
     const runId = pathname.replace("/api/runs/", "");
+    if (runId.includes("/")) return undefined;
     const deleted = ctx.runs.delete(runId);
     if (!deleted) return { status: 404, body: { error: "Run not found" } };
     return { status: 200, body: { deleted: true } };

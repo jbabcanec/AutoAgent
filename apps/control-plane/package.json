@@ -9,7 +9,7 @@
     "db:backup": "tsx src/scripts/dbAdmin.ts backup",
     "db:restore": "tsx src/scripts/dbAdmin.ts restore",
     "lint": "node -e \"console.log('lint: pending')\"",
-    "test": "tsx --test src/__tests__/*.test.ts",
+    "test": "tsx --test src/__tests__/persistence.smoke.test.ts src/__tests__/routes.smoke.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

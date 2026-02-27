@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 import {
   IPC_CHANNELS,
   type FollowUpAction,
-  type PlanStep,
   type RunLifecycleState,
   type RunStatusEvent,
   type StartRunInput
@@ -70,11 +69,17 @@ function createWindow(): void {
 }
 
 async function requestJson(pathname: string, init?: RequestInit): Promise<unknown> {
-  const response = await fetch(`${CONTROL_PLANE_BASE}${pathname}`, init);
-  if (!response.ok) {
-    throw new Error(`Request failed ${pathname}: ${response.status}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(`${CONTROL_PLANE_BASE}${pathname}`, { signal: controller.signal, ...init });
+    if (!response.ok) {
+      throw new Error(`Request failed ${pathname}: ${response.status}`);
+    }
+    return (await response.json()) as unknown;
+  } finally {
+    clearTimeout(timeout);
   }
-  return (await response.json()) as unknown;
 }
 
 function emitRunStatus(
@@ -291,6 +296,9 @@ interface AnthropicContentBlock {
   id?: string;
   name?: string;
   input?: Record<string, unknown>;
+  // Anthropic tool_result fields
+  tool_use_id?: string;
+  content?: string;
 }
 
 interface AnthropicResponse {
@@ -326,6 +334,119 @@ type AgentMessage =
 const MAX_AGENT_TURNS = 25;
 const PROMPT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
+// --- Normalized Provider Layer ---
+
+interface NormalizedTurn {
+  textContent: string | null;
+  toolCalls: Array<{ id: string; name: string; input: Record<string, unknown> }>;
+  rawAssistantMessage: AgentMessage;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+// --- Smart Tool Result Truncation ---
+
+function smartTruncate(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const headSize = Math.floor(maxChars * 0.6);
+  const tailSize = Math.floor(maxChars * 0.2);
+  const truncatedLines = text.slice(headSize, text.length - tailSize).split("\n").length;
+  return `${text.slice(0, headSize)}\n\n... [${truncatedLines} lines truncated] ...\n\n${text.slice(text.length - tailSize)}`;
+}
+
+// --- Token-Aware Context Compression ---
+
+function estimateTokens(messages: AgentMessage[]): number {
+  let chars = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
+      chars += msg.content.length;
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (typeof block === "object" && block !== null) {
+          chars += JSON.stringify(block).length;
+        }
+      }
+    }
+    if ("tool_calls" in msg && Array.isArray(msg.tool_calls)) {
+      chars += JSON.stringify(msg.tool_calls).length;
+    }
+  }
+  return Math.ceil(chars / 4);
+}
+
+// --- Repository Map ---
+
+function extractSymbols(content: string): string[] {
+  const symbols: string[] = [];
+  const patterns = [
+    /export\s+(?:default\s+)?(?:function|class|const|let|interface|type|enum)\s+(\w+)/g,
+    /^(?:function|class)\s+(\w+)/gm,
+    /^def\s+(\w+)/gm,
+    /^(?:pub\s+)?(?:fn|struct|enum|trait|impl)\s+(\w+)/gm,
+  ];
+  for (const pattern of patterns) {
+    for (const match of content.matchAll(pattern)) {
+      if (match[1]) symbols.push(match[1]);
+    }
+  }
+  return [...new Set(symbols)].slice(0, 10);
+}
+
+function buildRepoMap(projectDir: string, maxChars: number = 3000): string {
+  const IGNORE_DIRS = new Set([
+    "node_modules", ".git", "dist", "build", ".next", "out", "coverage",
+    "__pycache__", ".cache", ".vscode", ".idea", "dist-main", "dist-renderer",
+    ".pnpm", "target", "vendor", ".autoagent"
+  ]);
+  const SKIP_EXT = new Set([".lock", ".map", ".min.js", ".min.css", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot"]);
+
+  const entries: Array<{ path: string; size: number; summary: string }> = [];
+
+  function scan(dir: string): void {
+    let dirEntries: string[];
+    try { dirEntries = readdirSync(dir, { encoding: "utf8" }); } catch { return; }
+    for (const name of dirEntries) {
+      if (name.startsWith(".") && name !== ".env.example") continue;
+      const full = path.join(dir, name);
+      let st: ReturnType<typeof statSync>;
+      try { st = statSync(full); } catch { continue; }
+      if (st.isDirectory()) {
+        if (IGNORE_DIRS.has(name)) continue;
+        scan(full);
+      } else {
+        const ext = path.extname(name).toLowerCase();
+        if (SKIP_EXT.has(ext)) continue;
+        if (st.size > 500_000) continue; // Skip files > 500KB
+        let summary = "";
+        try {
+          const head = readFileSync(full, "utf8").slice(0, 2000);
+          const syms = extractSymbols(head);
+          if (syms.length > 0) summary = syms.join(", ");
+        } catch { /* skip binary/unreadable */ }
+        entries.push({ path: path.relative(projectDir, full).replaceAll("\\", "/"), size: st.size, summary });
+      }
+    }
+  }
+
+  scan(projectDir);
+  entries.sort((a, b) => a.path.localeCompare(b.path));
+
+  const lines: string[] = [];
+  let chars = 0;
+  for (const e of entries) {
+    const sizeStr = e.size < 1024 ? `${e.size}B` : `${Math.round(e.size / 1024)}KB`;
+    const line = e.summary ? `${e.path} (${sizeStr}) — ${e.summary}` : `${e.path} (${sizeStr})`;
+    if (chars + line.length + 1 > maxChars) {
+      lines.push(`... and ${entries.length - lines.length} more files`);
+      break;
+    }
+    lines.push(line);
+    chars += line.length + 1;
+  }
+  return lines.join("\n");
+}
+
 // --- Agentic LLM Callers ---
 
 async function callAnthropicAgent(
@@ -341,10 +462,10 @@ async function callAnthropicAgent(
   const cacheKey = createPromptCacheKey("anthropic-compatible", model, system, messages, maxTokens);
   const cached = await readPromptCache(cacheKey);
   if (cached) {
-    if (cacheTraceRunId) await appendTrace(cacheTraceRunId, "execution.cache_hit", { key: cacheKey, provider: "anthropic" });
+    if (cacheTraceRunId) appendTrace(cacheTraceRunId, "execution.cache_hit", { key: cacheKey, provider: "anthropic" });
     return cached as AnthropicResponse;
   }
-  if (cacheTraceRunId) await appendTrace(cacheTraceRunId, "execution.cache_miss", { key: cacheKey, provider: "anthropic" });
+  if (cacheTraceRunId) appendTrace(cacheTraceRunId, "execution.cache_miss", { key: cacheKey, provider: "anthropic" });
   // Convert messages to Anthropic format (no system role in messages array)
   const anthropicMessages = messages
     .filter((m) => m.role !== "system")
@@ -524,10 +645,10 @@ async function callOpenAiAgent(
   const cacheKey = createPromptCacheKey("openai-compatible", model, "", messages, maxTokens);
   const cached = await readPromptCache(cacheKey);
   if (cached) {
-    if (cacheTraceRunId) await appendTrace(cacheTraceRunId, "execution.cache_hit", { key: cacheKey, provider: "openai" });
+    if (cacheTraceRunId) appendTrace(cacheTraceRunId, "execution.cache_hit", { key: cacheKey, provider: "openai" });
     return cached as OpenAiResponse;
   }
-  if (cacheTraceRunId) await appendTrace(cacheTraceRunId, "execution.cache_miss", { key: cacheKey, provider: "openai" });
+  if (cacheTraceRunId) appendTrace(cacheTraceRunId, "execution.cache_miss", { key: cacheKey, provider: "openai" });
   const body: Record<string, unknown> = {
     model,
     messages,
@@ -681,6 +802,281 @@ async function callOpenAiAgentStreaming(
   };
 }
 
+// --- Provider Normalization ---
+
+async function callProviderStreaming(params: {
+  providerKind: "anthropic-compatible" | "openai-compatible" | "custom";
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  systemPrompt: string;
+  messages: AgentMessage[];
+  maxTokens: number;
+  tools: { anthropic: unknown[]; openai: unknown[] };
+  onDelta: (text: string) => void;
+  signal: AbortSignal;
+}): Promise<NormalizedTurn> {
+  if (params.providerKind === "anthropic-compatible") {
+    const resp = await callAnthropicAgentStreaming(
+      params.baseUrl, params.apiKey, params.model,
+      params.systemPrompt, params.messages, params.maxTokens,
+      params.onDelta, params.signal, params.tools.anthropic as Array<{ name: string; description: string; input_schema: Record<string, unknown> }>
+    );
+    const textParts: string[] = [];
+    const toolCalls: NormalizedTurn["toolCalls"] = [];
+    for (const block of resp.content ?? []) {
+      if (block.type === "text" && block.text) textParts.push(block.text);
+      if (block.type === "tool_use" && block.name && block.id) {
+        toolCalls.push({ id: block.id, name: block.name, input: (block.input ?? {}) as Record<string, unknown> });
+      }
+    }
+    return {
+      textContent: textParts.length > 0 ? textParts.join("") : null,
+      toolCalls,
+      rawAssistantMessage: { role: "assistant", content: resp.content ?? [] },
+      inputTokens: resp.usage?.input_tokens ?? 0,
+      outputTokens: resp.usage?.output_tokens ?? 0
+    };
+  }
+
+  // OpenAI-compatible path
+  const resp = await callOpenAiAgentStreaming(
+    params.baseUrl, params.apiKey, params.model,
+    params.messages, params.maxTokens,
+    params.onDelta, params.signal, params.tools.openai
+  );
+  const choice = resp.choices?.[0];
+  const msg = choice?.message;
+  const toolCalls: NormalizedTurn["toolCalls"] = [];
+  for (const tc of msg?.tool_calls ?? []) {
+    let parsed: Record<string, unknown> = {};
+    try { parsed = JSON.parse(tc.function.arguments || "{}") as Record<string, unknown>; } catch { /* malformed */ }
+    toolCalls.push({ id: tc.id, name: tc.function.name, input: parsed });
+  }
+  return {
+    textContent: msg?.content ?? null,
+    toolCalls,
+    rawAssistantMessage: {
+      role: "assistant",
+      content: msg?.content ?? null,
+      ...(toolCalls.length > 0 ? { tool_calls: msg?.tool_calls } : {})
+    } as AgentMessage,
+    inputTokens: resp.usage?.prompt_tokens ?? 0,
+    outputTokens: resp.usage?.completion_tokens ?? 0
+  };
+}
+
+function normalizeCachedResponse(providerKind: string, cached: unknown): NormalizedTurn {
+  if (providerKind === "anthropic-compatible") {
+    const resp = cached as AnthropicResponse;
+    const textParts: string[] = [];
+    const toolCalls: NormalizedTurn["toolCalls"] = [];
+    for (const block of resp.content ?? []) {
+      if (block.type === "text" && block.text) textParts.push(block.text);
+      if (block.type === "tool_use" && block.name && block.id) {
+        toolCalls.push({ id: block.id, name: block.name, input: (block.input ?? {}) as Record<string, unknown> });
+      }
+    }
+    return {
+      textContent: textParts.length > 0 ? textParts.join("") : null,
+      toolCalls,
+      rawAssistantMessage: { role: "assistant", content: resp.content ?? [] },
+      inputTokens: resp.usage?.input_tokens ?? 0,
+      outputTokens: resp.usage?.output_tokens ?? 0
+    };
+  }
+  const resp = cached as OpenAiResponse;
+  const choice = resp.choices?.[0];
+  const msg = choice?.message;
+  const toolCalls: NormalizedTurn["toolCalls"] = [];
+  for (const tc of msg?.tool_calls ?? []) {
+    let parsed: Record<string, unknown> = {};
+    try { parsed = JSON.parse(tc.function.arguments || "{}") as Record<string, unknown>; } catch { /* malformed */ }
+    toolCalls.push({ id: tc.id, name: tc.function.name, input: parsed });
+  }
+  return {
+    textContent: msg?.content ?? null,
+    toolCalls,
+    rawAssistantMessage: {
+      role: "assistant",
+      content: msg?.content ?? null,
+      ...(toolCalls.length > 0 ? { tool_calls: msg?.tool_calls } : {})
+    } as AgentMessage,
+    inputTokens: resp.usage?.prompt_tokens ?? 0,
+    outputTokens: resp.usage?.completion_tokens ?? 0
+  };
+}
+
+function buildToolResultMessages(
+  providerKind: string,
+  results: Array<{ id: string; content: string; isError: boolean }>
+): AgentMessage[] {
+  if (providerKind === "anthropic-compatible") {
+    return [{
+      role: "user",
+      content: results.map(r => ({
+        type: "tool_result" as const,
+        tool_use_id: r.id,
+        content: r.content,
+        ...(r.isError ? { is_error: true } : {})
+      }))
+    }];
+  }
+  return results.map(r => ({
+    role: "tool" as const,
+    tool_call_id: r.id,
+    content: r.content
+  }));
+}
+
+// --- Parallel Tool Execution ---
+
+const READ_ONLY_TOOLS = new Set(["read_file", "search_code", "glob_files", "list_directory"]);
+
+interface ToolExecContext {
+  projectDir: string;
+  runId: string;
+  turn: number;
+  signal: AbortSignal;
+  settingsData: Record<string, unknown>;
+  projectConfig: ProjectAgentConfig | undefined;
+  mcpToolMap: Map<string, { adapterId: string; toolName: string }>;
+}
+
+async function executeToolWithSafety(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  ctx: ToolExecContext
+): Promise<{ result: string; durationMs: number }> {
+  const start = Date.now();
+
+  // 1. Tool allowlist check
+  if (Array.isArray(ctx.projectConfig?.toolAllowlist) && !ctx.projectConfig!.toolAllowlist!.includes(toolName)) {
+    return { result: `Error: Tool "${toolName}" not in project allowlist`, durationMs: Date.now() - start };
+  }
+
+  // 2. Command inspection + egress (run_command only)
+  if (toolName === "run_command") {
+    const inspection = inspectCommand(String(toolInput.command ?? ""));
+    appendTrace(ctx.runId, "execution.command_inspection", {
+      turn: ctx.turn, command: inspection.normalizedCommand.slice(0, 300),
+      risk: inspection.risk, warnings: inspection.warnings,
+      violations: inspection.violations, externalHosts: inspection.externalHosts
+    });
+    if (inspection.violations.length > 0 || inspection.risk === "critical") {
+      return { result: `Error: Blocked: ${inspection.violations.join("; ") || "critical risk"}`, durationMs: Date.now() - start };
+    }
+    const egress = evaluateEgressPolicy({
+      hosts: inspection.externalHosts,
+      mode: (ctx.settingsData.egressPolicyMode as "off" | "audit" | "enforce") ?? "audit",
+      allowHosts: (ctx.settingsData.egressAllowHosts as string[]) ?? [],
+      exceptionHosts: Array.isArray(toolInput.egressExceptionHosts)
+        ? toolInput.egressExceptionHosts.filter((e): e is string => typeof e === "string")
+        : []
+    });
+    appendTrace(ctx.runId, "execution.egress_decision", {
+      turn: ctx.turn, tool: toolName, decision: egress.decision,
+      blockedHosts: egress.blockedHosts, reason: egress.reason
+    });
+    if (egress.decision === "deny") {
+      return { result: `Error: Blocked by egress policy: ${egress.reason}`, durationMs: Date.now() - start };
+    }
+    if (egress.decision === "needs_approval") {
+      const contextHash = hashApprovalContext(ctx.runId, ctx.turn, toolName, toolInput);
+      const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+      const approved = await requestToolApproval(ctx.runId, toolName, egress.reason, toolInput, contextHash, expiresAt);
+      if (!approved) {
+        return { result: `Error: Egress not approved for ${toolName}`, durationMs: Date.now() - start };
+      }
+    }
+  }
+
+  // 3. Generic tool policy
+  const policy = evaluateToolPolicy({ toolName, input: toolInput });
+  if (policy.decision === "deny") {
+    return { result: `Error: Denied by policy: ${policy.reason}`, durationMs: Date.now() - start };
+  }
+  if (policy.decision === "needs_approval") {
+    const contextHash = hashApprovalContext(ctx.runId, ctx.turn, toolName, toolInput);
+    const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+    const approved = await requestToolApproval(ctx.runId, toolName, policy.reason, toolInput, contextHash, expiresAt);
+    if (!approved) {
+      return { result: `Error: Tool rejected by operator: ${toolName}`, durationMs: Date.now() - start };
+    }
+  }
+
+  // 4. Execute (MCP or built-in) with retry
+  const mcpMapping = ctx.mcpToolMap.get(toolName);
+  let result: string;
+  try {
+    result = await withRetry(
+      () => mcpMapping
+        ? executeMcpTool(mcpMapping.adapterId, mcpMapping.toolName, toolInput)
+        : executeToolAsync(toolName, toolInput, ctx.projectDir, ctx.signal),
+      retryPolicyFor("tool", "tool"),
+      async (attempt, error) => {
+        appendTrace(ctx.runId, "execution.retry", {
+          attempt, stage: "tool", tool: toolName, error, errorClass: classifyRetryError(error)
+        });
+      }
+    );
+  } catch (err) {
+    result = `Error: ${err instanceof Error ? err.message : "Unknown error"}`;
+  }
+
+  // 5. Validation + artifact
+  const validation = validateToolOutcome({
+    toolName: mcpMapping ? mcpMapping.toolName : toolName,
+    toolInput, toolResult: result, projectDir: ctx.projectDir
+  });
+  await createVerificationArtifact({
+    runId: ctx.runId,
+    verificationType: validation.verificationType,
+    artifactType: "tool_result",
+    verificationResult: validation.ok ? "pass" : validation.severity === "warn" ? "warning" : "fail",
+    artifactContent: result.slice(0, 4000),
+    checks: validation.checks.map((check) => ({
+      check, passed: validation.ok,
+      severity: validation.severity === "error" ? "error" : validation.severity === "warn" ? "warn" : "info"
+    }))
+  });
+
+  // 6. Hook
+  await runHook(ctx.runId, "tool_result", {
+    turn: ctx.turn, tool: toolName, ok: !result.startsWith("Error:")
+  }, ctx.projectConfig?.hooks, ctx.projectDir);
+
+  return { result, durationMs: Date.now() - start };
+}
+
+async function executeToolCallsBatch(
+  toolCalls: Array<{ id: string; name: string; input: Record<string, unknown> }>,
+  ctx: ToolExecContext
+): Promise<Array<{ id: string; name: string; result: string; durationMs: number }>> {
+  const readOnly = toolCalls.filter(tc => READ_ONLY_TOOLS.has(tc.name));
+  const mutating = toolCalls.filter(tc => !READ_ONLY_TOOLS.has(tc.name));
+  const results: Array<{ id: string; name: string; result: string; durationMs: number }> = [];
+
+  // Read-only: run in parallel
+  if (readOnly.length > 0) {
+    const parallel = await Promise.all(
+      readOnly.map(async tc => {
+        const { result, durationMs } = await executeToolWithSafety(tc.name, tc.input, ctx);
+        return { id: tc.id, name: tc.name, result, durationMs };
+      })
+    );
+    results.push(...parallel);
+  }
+
+  // Mutating: run sequentially
+  for (const tc of mutating) {
+    const { result, durationMs } = await executeToolWithSafety(tc.name, tc.input, ctx);
+    results.push({ id: tc.id, name: tc.name, result, durationMs });
+  }
+
+  return results;
+}
+
 // --- Core Agentic Execution ---
 
 async function executeRun(
@@ -701,7 +1097,7 @@ async function executeRun(
 
   try {
     const projectConfig = loadProjectConfig(input.directory);
-    await appendTrace(run.runId, "execution.project_config", {
+    appendTrace(run.runId, "execution.project_config", {
       hasConfig: projectConfig !== null,
       toolAllowlist: projectConfig?.toolAllowlist ?? null,
       contextBudgetTokens: projectConfig?.contextBudgetTokens ?? null
@@ -712,8 +1108,9 @@ async function executeRun(
       objective: input.objective,
       changedFiles: []
     });
-    await appendTrace(run.runId, "context.retrieval", {
+    appendTrace(run.runId, "context.retrieval", {
       objective: input.objective,
+      directory: input.directory,
       telemetry: context.retrievalTelemetry
     });
     emitRunStatus(run.runId, "executing", "Prepared context for execution.", { type: "info" });
@@ -762,80 +1159,66 @@ async function executeRun(
     });
 
     // 3. Build initial messages
-    const systemPrompt = `You are AutoAgent, a senior AI developer agent that executes tasks by writing real code, creating files, and running commands.
+    const systemPrompt = `You are AutoAgent, an autonomous AI coding agent. You build complete, production-quality software by writing code, creating files, and running commands.
 
-CRITICAL: You MUST use your tools to actually build things. NEVER just describe or explain — ALWAYS execute.
+EXECUTION FIRST: Call a tool on your very first response. Never produce planning prose before taking action — the plan lives in your actions. Use agent_notes only AFTER completing a significant step, never to plan what you will do next.
 
-You have these tools:
-- write_file: Create/overwrite files (parent dirs created automatically)
-- edit_file: Apply targeted edits inside an existing file
-- read_file: Read existing file contents
-- search_code: Search for matching text in repository files
-- glob_files: Discover files by pattern
-- run_command: Execute shell commands (install deps, run scripts, test, etc.)
-- git_status/git_diff/git_add/git_commit: Guarded git workflow tools
-- list_directory: List directory contents
-${mcpDefs.toolMap.size > 0 ? `\nYou also have ${mcpDefs.toolMap.size} MCP tool(s) available from external servers. Use them when appropriate.\n` : ""}
-Working directory: ${input.directory}
-All file paths are relative to this directory. Write files DIRECTLY here — do NOT create a subdirectory with an arbitrary project name.
+VERIFICATION: After writing a file, read it back to confirm contents. After running a command, interpret the actual exit code and stdout — never claim success without evidence. For GUI apps, verify via syntax-check (python -m py_compile, node --check) rather than claiming a window appeared.
 
-Execution rules:
-1. ALWAYS create complete, production-quality code — not stubs or placeholders
-2. Create ALL necessary files: source code, config, package.json, README, etc.
-3. Install dependencies with the appropriate package manager
-4. After writing code, VERIFY it works by running a test or a quick check command
-5. If something fails, read the error, fix it, and retry
-6. Create proper project structure with organized directories
-7. Add error handling and input validation in your code
-8. When done, give a concise 2-3 sentence summary of what you built and how to use it
+## How You Work
 
-IMPORTANT constraints:
-- NEVER start long-running servers (e.g. node server.js, npm start, pnpm start). They will timeout and kill execution. Instead, verify by running tests or quick checks.
-- Commands have a 30-second timeout. Use only short-lived commands.
-- Write all files relative to the working directory root. Do NOT nest inside arbitrary subdirectories.
+You have tools to read, write, edit files, run commands, and search code. You decide what to do and when. There are no artificial phases — you plan, build, test, and iterate in whatever order makes sense.
 
-Think step by step. Plan what you need to build, then execute each step using tools. Do NOT stop after just 1-2 actions — keep going until the task is fully complete and verified.`;
+**Your workflow for any task:**
+1. Understand what's being asked. If the project directory has existing code, use search_code and glob_files to understand the codebase first.
+2. Plan your approach internally. Use agent_notes to track your plan for complex tasks.
+3. Build incrementally — create files, install dependencies, write code.
+4. Test and verify — run the code, check for errors, fix issues.
+5. Keep iterating until everything works. Don't stop at the first working version if there are obvious improvements.
+6. When truly done, stop calling tools and write a concise summary.
 
-    const userPrompt = `## Task
-${input.objective}
+## Quality Standards
 
-## Current Directory Structure
-${context.tree}
+Build complete, production-quality output: error handling, input validation, all expected features. Test your work by running it. Don't stop at the first working version.
+${mcpDefs.toolMap.size > 0 ? `\nYou have ${mcpDefs.toolMap.size} MCP tool(s) available from external servers — use them when appropriate.\n` : ""}
+## Tips
+- Batch read-only calls (read_file, search_code, glob_files, list_directory) — they run in parallel
+- Use search_code to find things instead of reading every file
+- read_file before edit_file to get accurate line numbers; re-read if they shift after edits
+- run_command has a 30s timeout — do NOT start long-running servers
+- agent_notes survives context compression — use it for plan/progress on long tasks
 
-${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## This is an empty or new directory."}`;
+## Environment
+- Working directory: \`${input.directory}\`
+- All file paths are relative to the working directory.
+- Write files directly here — do NOT create subdirectories with arbitrary project names.`;
+
+    // Build repo map for codebase awareness
+    const repoMap = buildRepoMap(input.directory, 2000);
+
+    const userPrompt = `## Task\n${input.objective}\n\n${repoMap}\n\n${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## This is an empty or new directory."}`;
 
     const historicalMessages = await loadThreadMessages(threadId);
-    const historyTail = historicalMessages.slice(-8).map((msg): AgentMessage => {
+    // Budget-based history window: fill from most-recent backwards up to 24k chars.
+    // Adapts automatically — small messages keep more turns, large tool-result turns keep fewer.
+    const HISTORY_BUDGET_CHARS = 24_000;
+    let historyBudget = HISTORY_BUDGET_CHARS;
+    const selectedHistory: typeof historicalMessages = [];
+    for (let i = historicalMessages.length - 1; i >= 0; i--) {
+      const msg = historicalMessages[i]!;
+      if (msg.content.length > historyBudget) break;
+      selectedHistory.unshift(msg);
+      historyBudget -= msg.content.length;
+    }
+    const historyTail = selectedHistory.map((msg): AgentMessage => {
       if (msg.role === "assistant") return { role: "assistant", content: msg.content };
       if (msg.role === "system") return { role: "system", content: msg.content };
       return { role: "user", content: msg.content };
     });
     const messages: AgentMessage[] = [{ role: "system", content: systemPrompt }, ...historyTail, { role: "user", content: userPrompt }];
 
-    // Pre-execution planning turn (no tools) to enforce think-then-act behavior.
-    const planningText = await runPlanningTurn({
-      providerKind: provider.kind,
-      baseUrl: provider.baseUrl,
-      apiKey,
-      model: modelName,
-      objective: input.objective,
-      contextTree: context.tree,
-      maxTokens
-    });
-    const planSteps = parsePlanSteps(planningText);
-    emitRunStatus(run.runId, "executing", "Execution plan generated.", {
-      type: "plan",
-      planSteps,
-      detail: planningText
-    });
-    await appendTrace(run.runId, "execution.plan", {
-      planText: planningText,
-      planSteps
-    });
-    await runHook(run.runId, "planning", { turn: 0, planSteps: planSteps.length }, projectConfig?.hooks, input.directory);
-    await appendThreadMessage(threadId, "assistant", planningText, 0, { type: "plan" });
 
-    await appendTrace(run.runId, "llm.request", {
+    appendTrace(run.runId, "llm.request", {
       model: modelName,
       promptLength: userPrompt.length,
       maxTokens,
@@ -843,10 +1226,10 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
     });
     emitRunStatus(run.runId, "executing", `Starting agent with ${modelName}...`, { type: "info", model: modelName });
 
-    // 4. Agentic loop with turn tracking
+    // 4. Canonical agentic loop — the model drives everything
     const allTextResponses: string[] = [];
-    await appendThreadMessage(threadId, "system", systemPrompt, 0);
-    await appendThreadMessage(threadId, "user", userPrompt, 0);
+    appendThreadMessage(threadId, "system", systemPrompt, 0);
+    appendThreadMessage(threadId, "user", userPrompt, 0);
     let actionCount = resumeFrom?.stats.actionCount ?? 0;
     let totalInputTokens = resumeFrom?.stats.totalInputTokens ?? 0;
     let totalOutputTokens = resumeFrom?.stats.totalOutputTokens ?? 0;
@@ -854,629 +1237,147 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
     let retryCount = resumeFrom?.stats.retries ?? 0;
     let safetyViolations = 0;
     let validationFailures = 0;
+    const toolCtx: ToolExecContext = {
+      projectDir: input.directory,
+      runId: run.runId,
+      turn: 0,
+      signal: controller.signal,
+      settingsData: settingsData as Record<string, unknown>,
+      projectConfig: projectConfig ?? undefined,
+      mcpToolMap: mcpDefs.toolMap
+    };
 
-    for (let turn = 0; turn < MAX_AGENT_TURNS; turn++) {
-      if (controller.signal.aborted) {
-        throw new Error("Execution aborted by operator.");
-      }
-      const turnNum = turn + 1;
+    for (let turn = 1; turn <= MAX_AGENT_TURNS; turn++) {
+      if (controller.signal.aborted) throw new Error("Execution aborted by operator.");
+      toolCtx.turn = turn;
+
+      // Token-aware context compression
+      await compressIfNeeded(messages, provider.kind, provider.baseUrl, apiKey, modelName);
+
+      // Call LLM (provider-agnostic, streaming)
       const turnStart = Date.now();
-      await compressMessagesWithLLM(
-        messages,
-        {
-          maxMessages: projectConfig?.contextHistoryMaxMessages ?? settingsData.contextHistoryMaxMessages ?? 28,
-          summaryMaxChars: projectConfig?.contextSummaryMaxChars ?? settingsData.contextSummaryMaxChars ?? 2400
+      const turnResult = await withRetry(
+        async () => {
+          guardCircuit(circuit, Date.now());
+          // Prompt cache disabled — full-message hashing yields <5% hit rate.
+          // Saves 2 HTTP round-trips (~100ms) per turn.
+          const result = await callProviderStreaming({
+            providerKind: provider.kind,
+            baseUrl: provider.baseUrl,
+            apiKey,
+            model: modelName,
+            systemPrompt,
+            messages,
+            maxTokens,
+            tools: { anthropic: allAnthropicTools, openai: allOpenaiTools },
+            onDelta: (d) => emitRunStatus(run.runId, "executing", d, { type: "llm_delta", turn, detail: d }),
+            signal: controller.signal
+          });
+          recordCircuitSuccess(circuit);
+          return result;
         },
-        async (prompt) => {
-          if (provider.kind === "anthropic-compatible") {
-            const resp = await callAnthropicAgent(provider.baseUrl, apiKey, modelName, prompt, [{ role: "user", content: "Summarize." }], 512, controller.signal);
-            return resp.content?.find((b) => b.type === "text")?.text ?? "";
-          }
-          const resp = await callOpenAiAgent(provider.baseUrl, apiKey, modelName, [{ role: "system", content: prompt }, { role: "user", content: "Summarize." }], 512, controller.signal);
-          return resp.choices?.[0]?.message?.content ?? "";
+        retryPolicyFor("transient", "llm"),
+        async (attempt, error) => {
+          retryCount++;
+          recordCircuitFailure(circuit, Date.now());
+          appendTrace(run.runId, "execution.retry", {
+            attempt, stage: "llm", error: String(error), errorClass: classifyRetryError(error)
+          });
         }
       );
+      const turnDuration = Date.now() - turnStart;
 
-      if (provider.kind === "anthropic-compatible") {
-        // --- Anthropic agentic turn (with real streaming) ---
-        const response = await withRetry(
-          async () => {
-            guardCircuit(circuit, Date.now());
-            // Check prompt cache first for a non-streaming hit
-            const cacheKey = createPromptCacheKey("anthropic-compatible", modelName, systemPrompt, messages, maxTokens);
-            const cached = await readPromptCache(cacheKey);
-            if (cached) {
-              await appendTrace(run.runId, "execution.cache_hit", { key: cacheKey, provider: "anthropic" });
-              recordCircuitSuccess(circuit);
-              return cached as AnthropicResponse;
-            }
-            await appendTrace(run.runId, "execution.cache_miss", { key: cacheKey, provider: "anthropic" });
-            const value = await callAnthropicAgentStreaming(
-              provider.baseUrl,
-              apiKey,
-              modelName,
-              systemPrompt,
-              messages,
-              maxTokens,
-              (delta) => {
-                emitRunStatus(run.runId, "executing", delta, { type: "llm_delta", turn: turnNum, detail: delta });
-              },
-              controller.signal,
-              allAnthropicTools
-            );
-            await writePromptCache(cacheKey, value);
-            recordCircuitSuccess(circuit);
-            return value;
-          },
-          retryPolicyFor("transient", "llm"),
-          async (attempt, error) => {
-            retryCount += 1;
-            recordCircuitFailure(circuit, Date.now());
-            await appendTrace(run.runId, "execution.retry", {
-              attempt,
-              stage: "llm.anthropic",
-              error,
-              errorClass: classifyRetryError(error)
-            });
-          }
-        );
-        const turnDuration = Date.now() - turnStart;
-        const contentBlocks = response.content ?? [];
+      // Track tokens
+      totalInputTokens += turnResult.inputTokens;
+      totalOutputTokens += turnResult.outputTokens;
+      appendTrace(run.runId, "llm.turn", {
+        provider: provider.kind, model: modelName, turn,
+        durationMs: turnDuration,
+        inputTokens: turnResult.inputTokens, outputTokens: turnResult.outputTokens
+      });
+      emitRunStatus(run.runId, "executing", `Turn ${turn}`, {
+        type: "info", turn, model: modelName, duration: turnDuration,
+        ...(turnResult.inputTokens ? { tokenUsage: { input: turnResult.inputTokens, output: turnResult.outputTokens } } : {})
+      });
 
-        // Capture token usage
-        const turnTokens = response.usage
-          ? { input: response.usage.input_tokens, output: response.usage.output_tokens }
-          : undefined;
-        if (turnTokens) {
-          totalInputTokens += turnTokens.input;
-          totalOutputTokens += turnTokens.output;
-        }
-        await appendTrace(run.runId, "llm.turn", {
-          provider: provider.kind,
-          model: modelName,
-          turn: turnNum,
-          durationMs: turnDuration,
-          inputTokens: turnTokens?.input ?? 0,
-          outputTokens: turnTokens?.output ?? 0
-        });
-
-        emitRunStatus(run.runId, "executing", `Turn ${turnNum}`, {
-          type: "info", turn: turnNum, model: modelName, duration: turnDuration,
-          ...(turnTokens ? { tokenUsage: turnTokens } : {})
-        });
-
-        // Process content blocks
-        const toolResults: AnthropicContentBlock[] = [];
-        for (const block of contentBlocks) {
-          if (block.type === "text" && block.text) {
-            allTextResponses.push(block.text);
-            await appendThreadMessage(threadId, "assistant", block.text, turnNum);
-            emitRunStatus(run.runId, "executing", block.text.slice(0, 500), { type: "llm_text", turn: turnNum, detail: block.text });
-            await appendTrace(run.runId, "llm.text", { text: block.text, turn: turnNum });
-          }
-          if (block.type === "tool_use" && block.name && block.id) {
-            const toolName = block.name;
-            const toolInput = (block.input ?? {}) as Record<string, unknown>;
-            if (toolName === "ask_user") {
-              const question = String(toolInput.question ?? "").trim();
-              const prompt = await createUserPrompt({
-                runId: run.runId,
-                threadId,
-                turnNumber: turnNum,
-                promptText: question || "Please clarify the requirement.",
-                context: isRecord(toolInput) ? toolInput : {}
-              });
-              emitRunStatus(run.runId, "executing", prompt.promptText, {
-                type: "ask_user",
-                turn: turnNum,
-                promptId: prompt.promptId
-              });
-              const answer = await waitForPromptAnswer(prompt.promptId, controller.signal);
-              const resultText = `Operator answer: ${answer}`;
-              toolResults.push({ type: "tool_result", id: block.id, text: resultText } as unknown as AnthropicContentBlock);
-              await appendThreadMessage(threadId, "user", `Q: ${prompt.promptText}\nA: ${answer}`, turnNum, { type: "ask_user_answer" });
-              await appendTrace(run.runId, "ask_user.answered", { promptId: prompt.promptId, turn: turnNum });
-              continue;
-            }
-            const toolInputSummary = describeToolInput(toolName, toolInput);
-            emitRunStatus(run.runId, "executing", describeToolCall(toolName, toolInput), {
-              type: "tool_call", turn: turnNum, toolName, toolInput: toolInputSummary
-            });
-            await appendTrace(run.runId, "agent.tool_call", { tool: toolName, input: toolInput, turn: turnNum });
-
-            const toolStart = Date.now();
-            let result: string;
-            try {
-              if (Array.isArray(projectConfig?.toolAllowlist) && !projectConfig.toolAllowlist.includes(toolName)) {
-                throw new Error(`Tool disallowed by project config: ${toolName}`);
-              }
-              if (toolName === "run_command") {
-                const inspection = inspectCommand(String(toolInput.command ?? ""));
-                await appendTrace(run.runId, "execution.command_inspection", {
-                  turn: turnNum,
-                  command: inspection.normalizedCommand.slice(0, 300),
-                  risk: inspection.risk,
-                  warnings: inspection.warnings,
-                  violations: inspection.violations,
-                  externalHosts: inspection.externalHosts
-                });
-                if (inspection.violations.length > 0 || inspection.risk === "critical") {
-                  safetyViolations += 1;
-                  throw new Error(`Blocked command by validator: ${inspection.violations.join("; ") || "critical risk detected"}`);
-                }
-                const egress = evaluateEgressPolicy({
-                  hosts: inspection.externalHosts,
-                  mode: settingsData.egressPolicyMode ?? "audit",
-                  allowHosts: settingsData.egressAllowHosts ?? [],
-                  exceptionHosts: Array.isArray(toolInput.egressExceptionHosts)
-                    ? toolInput.egressExceptionHosts.filter((entry): entry is string => typeof entry === "string")
-                    : []
-                });
-                await appendTrace(run.runId, "execution.egress_decision", {
-                  turn: turnNum,
-                  tool: toolName,
-                  decision: egress.decision,
-                  blockedHosts: egress.blockedHosts,
-                  reason: egress.reason
-                });
-                if (egress.decision === "deny") {
-                  safetyViolations += 1;
-                  throw new Error(`Denied by egress policy: ${egress.reason}`);
-                }
-                if (egress.decision === "needs_approval") {
-                  const contextHash = hashApprovalContext(run.runId, turnNum, toolName, toolInput);
-                  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
-                  const approved = await requestToolApproval(run.runId, toolName, egress.reason, toolInput, contextHash, expiresAt);
-                  if (!approved) {
-                    throw new Error(`Egress not approved for tool: ${toolName}`);
-                  }
-                }
-              }
-              const policy = evaluateToolPolicy({ toolName, input: toolInput });
-              if (policy.decision === "deny") {
-                safetyViolations += 1;
-                throw new Error(`Denied by policy: ${policy.reason}`);
-              }
-              if (policy.decision === "needs_approval") {
-                const contextHash = hashApprovalContext(run.runId, turnNum, toolName, toolInput);
-                const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
-                const approved = await requestToolApproval(run.runId, toolName, policy.reason, toolInput, contextHash, expiresAt);
-                if (!approved) {
-                  throw new Error(`Tool rejected by operator: ${toolName}`);
-                }
-              }
-              const mcpMapping = mcpDefs.toolMap.get(toolName);
-              result = await withRetry(
-                async () => {
-                  if (mcpMapping) {
-                    return executeMcpTool(mcpMapping.adapterId, mcpMapping.toolName, toolInput);
-                  }
-                  return executeToolAsync(toolName, toolInput, input.directory, controller.signal);
-                },
-                retryPolicyFor("tool", "tool"),
-                async (attempt, error) => {
-                  retryCount += 1;
-                  await appendTrace(run.runId, "execution.retry", {
-                    attempt,
-                    stage: "tool",
-                    tool: toolName,
-                    error,
-                    errorClass: classifyRetryError(error)
-                  });
-                }
-              );
-              const validation = validateToolOutcome({
-                toolName: mcpMapping ? mcpMapping.toolName : toolName,
-                toolInput,
-                toolResult: result,
-                projectDir: input.directory
-              });
-              await appendTrace(run.runId, "execution.validation", {
-                turn: turnNum,
-                tool: toolName,
-                ok: validation.ok,
-                severity: validation.severity,
-                confidence: validation.confidence,
-                verificationType: validation.verificationType,
-                checks: validation.checks
-              });
-              await createVerificationArtifact({
-                runId: run.runId,
-                verificationType: validation.verificationType,
-                artifactType: "tool_result",
-                verificationResult: validation.ok ? "pass" : validation.severity === "warn" ? "warning" : "fail",
-                artifactContent: result.slice(0, 4000),
-                checks: validation.checks.map((check) => ({
-                  check,
-                  passed: validation.ok,
-                  severity: validation.severity === "error" ? "error" : validation.severity === "warn" ? "warn" : "info"
-                }))
-              });
-              if (!validation.ok) {
-                validationFailures += 1;
-              }
-              actionCount++;
-              await runHook(run.runId, "tool_result", {
-                turn: turnNum,
-                tool: toolName,
-                ok: !result.startsWith("Error:")
-              }, projectConfig?.hooks, input.directory);
-            } catch (err) {
-              result = `Error: ${err instanceof Error ? err.message : "Unknown error"}`;
-            }
-            const toolDuration = Date.now() - toolStart;
-
-            emitRunStatus(run.runId, "executing", result.length > 200 ? result.slice(0, 200) + "..." : result, {
-              type: "tool_result", turn: turnNum, toolName, duration: toolDuration, detail: result
-            });
-            await appendTrace(run.runId, "agent.tool_result", {
-              tool: toolName,
-              result: result.slice(0, 4000),
-              turn: turnNum,
-              durationMs: toolDuration
-            });
-
-            toolResults.push({ type: "tool_result", id: block.id, text: result } as unknown as AnthropicContentBlock);
-          }
-        }
-
-        messages.push({ role: "assistant", content: contentBlocks });
-
-        if (toolResults.length > 0) {
-          messages.push({ role: "user", content: toolResults });
-          const checkpointState: PersistedExecutionState = {
-            runId: run.runId,
-            phase: "checkpointed",
-            phaseMarker: "executing",
-            turn: turnNum,
-            input,
-            stats: {
-              actionCount,
-              totalInputTokens,
-              totalOutputTokens,
-              retries: retryCount,
-              validationFailures,
-              safetyViolations
-            },
-            checkpoint: {
-              at: new Date().toISOString(),
-              reason: "anthropic.tool_result",
-              messageCount: messages.length
-            },
-            replayBoundary: createReplayBoundary(run.runId, turnNum, "anthropic.tool_result", messages.length)
-          };
-          await saveExecutionState(requestJson, run.runId, checkpointState);
-          await appendTrace(run.runId, "execution.checkpoint", { turn: turnNum, reason: "anthropic.tool_result" });
-          continue;
-        }
-
-        if (response.stop_reason === "end_turn" || response.stop_reason === "stop" || toolResults.length === 0) {
-          break;
-        }
-      } else {
-        // --- OpenAI-compatible agentic turn (with real streaming) ---
-        const response = await withRetry(
-          async () => {
-            guardCircuit(circuit, Date.now());
-            // Check prompt cache first for a non-streaming hit
-            const cacheKey = createPromptCacheKey("openai-compatible", modelName, "", messages, maxTokens);
-            const cached = await readPromptCache(cacheKey);
-            if (cached) {
-              await appendTrace(run.runId, "execution.cache_hit", { key: cacheKey, provider: "openai" });
-              recordCircuitSuccess(circuit);
-              return cached as OpenAiResponse;
-            }
-            await appendTrace(run.runId, "execution.cache_miss", { key: cacheKey, provider: "openai" });
-            const value = await callOpenAiAgentStreaming(
-              provider.baseUrl,
-              apiKey,
-              modelName,
-              messages,
-              maxTokens,
-              (delta) => {
-                emitRunStatus(run.runId, "executing", delta, { type: "llm_delta", turn: turnNum, detail: delta });
-              },
-              controller.signal,
-              allOpenaiTools
-            );
-            await writePromptCache(cacheKey, value);
-            recordCircuitSuccess(circuit);
-            return value;
-          },
-          retryPolicyFor("transient", "llm"),
-          async (attempt, error) => {
-            retryCount += 1;
-            recordCircuitFailure(circuit, Date.now());
-            await appendTrace(run.runId, "execution.retry", {
-              attempt,
-              stage: "llm.openai",
-              error,
-              errorClass: classifyRetryError(error)
-            });
-          }
-        );
-        const turnDuration = Date.now() - turnStart;
-        const choice = response.choices?.[0];
-        const assistantMessage = choice?.message;
-
-        // Capture token usage
-        const turnTokens = response.usage
-          ? { input: response.usage.prompt_tokens, output: response.usage.completion_tokens }
-          : undefined;
-        if (turnTokens) {
-          totalInputTokens += turnTokens.input;
-          totalOutputTokens += turnTokens.output;
-        }
-        await appendTrace(run.runId, "llm.turn", {
-          provider: provider.kind,
-          model: modelName,
-          turn: turnNum,
-          durationMs: turnDuration,
-          inputTokens: turnTokens?.input ?? 0,
-          outputTokens: turnTokens?.output ?? 0
-        });
-
-        emitRunStatus(run.runId, "executing", `Turn ${turnNum}`, {
-          type: "info", turn: turnNum, model: modelName, duration: turnDuration,
-          ...(turnTokens ? { tokenUsage: turnTokens } : {})
-        });
-
-        if (assistantMessage?.content) {
-          allTextResponses.push(assistantMessage.content);
-          await appendThreadMessage(threadId, "assistant", assistantMessage.content, turnNum);
-          emitRunStatus(run.runId, "executing", assistantMessage.content.slice(0, 500), { type: "llm_text", turn: turnNum, detail: assistantMessage.content });
-          await appendTrace(run.runId, "llm.text", { text: assistantMessage.content, turn: turnNum });
-        }
-
-        const toolCalls = assistantMessage?.tool_calls ?? [];
-
-        messages.push({
-          role: "assistant",
-          content: assistantMessage?.content ?? null,
-          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
-        });
-
-        if (toolCalls.length > 0) {
-          for (const tc of toolCalls) {
-            let toolInput: Record<string, unknown> = {};
-            try {
-              toolInput = JSON.parse(tc.function.arguments) as Record<string, unknown>;
-            } catch { /* malformed args */ }
-
-            if (tc.function.name === "ask_user") {
-              const question = String(toolInput.question ?? "").trim();
-              const prompt = await createUserPrompt({
-                runId: run.runId,
-                threadId,
-                turnNumber: turnNum,
-                promptText: question || "Please clarify the requirement.",
-                context: isRecord(toolInput) ? toolInput : {}
-              });
-              emitRunStatus(run.runId, "executing", prompt.promptText, {
-                type: "ask_user",
-                turn: turnNum,
-                promptId: prompt.promptId
-              });
-              const answer = await waitForPromptAnswer(prompt.promptId, controller.signal);
-              const resultText = `Operator answer: ${answer}`;
-              messages.push({ role: "tool", tool_call_id: tc.id, content: resultText });
-              await appendThreadMessage(threadId, "user", `Q: ${prompt.promptText}\nA: ${answer}`, turnNum, { type: "ask_user_answer" });
-              await appendTrace(run.runId, "ask_user.answered", { promptId: prompt.promptId, turn: turnNum });
-              continue;
-            }
-
-            const toolInputSummary = describeToolInput(tc.function.name, toolInput);
-            emitRunStatus(run.runId, "executing", describeToolCall(tc.function.name, toolInput), {
-              type: "tool_call", turn: turnNum, toolName: tc.function.name, toolInput: toolInputSummary
-            });
-            await appendTrace(run.runId, "agent.tool_call", { tool: tc.function.name, input: toolInput, turn: turnNum });
-
-            const toolStart = Date.now();
-            let result: string;
-            try {
-              if (Array.isArray(projectConfig?.toolAllowlist) && !projectConfig.toolAllowlist.includes(tc.function.name)) {
-                throw new Error(`Tool disallowed by project config: ${tc.function.name}`);
-              }
-              if (tc.function.name === "run_command") {
-                const inspection = inspectCommand(String(toolInput.command ?? ""));
-                await appendTrace(run.runId, "execution.command_inspection", {
-                  turn: turnNum,
-                  command: inspection.normalizedCommand.slice(0, 300),
-                  risk: inspection.risk,
-                  warnings: inspection.warnings,
-                  violations: inspection.violations,
-                  externalHosts: inspection.externalHosts
-                });
-                if (inspection.violations.length > 0 || inspection.risk === "critical") {
-                  safetyViolations += 1;
-                  throw new Error(`Blocked command by validator: ${inspection.violations.join("; ") || "critical risk detected"}`);
-                }
-                const egress = evaluateEgressPolicy({
-                  hosts: inspection.externalHosts,
-                  mode: settingsData.egressPolicyMode ?? "audit",
-                  allowHosts: settingsData.egressAllowHosts ?? [],
-                  exceptionHosts: Array.isArray(toolInput.egressExceptionHosts)
-                    ? toolInput.egressExceptionHosts.filter((entry): entry is string => typeof entry === "string")
-                    : []
-                });
-                await appendTrace(run.runId, "execution.egress_decision", {
-                  turn: turnNum,
-                  tool: tc.function.name,
-                  decision: egress.decision,
-                  blockedHosts: egress.blockedHosts,
-                  reason: egress.reason
-                });
-                if (egress.decision === "deny") {
-                  safetyViolations += 1;
-                  throw new Error(`Denied by egress policy: ${egress.reason}`);
-                }
-                if (egress.decision === "needs_approval") {
-                  const contextHash = hashApprovalContext(run.runId, turnNum, tc.function.name, toolInput);
-                  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
-                  const approved = await requestToolApproval(
-                    run.runId,
-                    tc.function.name,
-                    egress.reason,
-                    toolInput,
-                    contextHash,
-                    expiresAt
-                  );
-                  if (!approved) {
-                    throw new Error(`Egress not approved for tool: ${tc.function.name}`);
-                  }
-                }
-              }
-              const policy = evaluateToolPolicy({ toolName: tc.function.name, input: toolInput });
-              if (policy.decision === "deny") {
-                safetyViolations += 1;
-                throw new Error(`Denied by policy: ${policy.reason}`);
-              }
-              if (policy.decision === "needs_approval") {
-                const contextHash = hashApprovalContext(run.runId, turnNum, tc.function.name, toolInput);
-                const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
-                const approved = await requestToolApproval(
-                  run.runId,
-                  tc.function.name,
-                  policy.reason,
-                  toolInput,
-                  contextHash,
-                  expiresAt
-                );
-                if (!approved) {
-                  throw new Error(`Tool rejected by operator: ${tc.function.name}`);
-                }
-              }
-              const mcpMappingOai = mcpDefs.toolMap.get(tc.function.name);
-              result = await withRetry(
-                async () => {
-                  if (mcpMappingOai) {
-                    return executeMcpTool(mcpMappingOai.adapterId, mcpMappingOai.toolName, toolInput);
-                  }
-                  return executeToolAsync(tc.function.name, toolInput, input.directory, controller.signal);
-                },
-                retryPolicyFor("tool", "tool"),
-                async (attempt, error) => {
-                  retryCount += 1;
-                  await appendTrace(run.runId, "execution.retry", {
-                    attempt,
-                    stage: "tool",
-                    tool: tc.function.name,
-                    error,
-                    errorClass: classifyRetryError(error)
-                  });
-                }
-              );
-              const validation = validateToolOutcome({
-                toolName: mcpMappingOai ? mcpMappingOai.toolName : tc.function.name,
-                toolInput,
-                toolResult: result,
-                projectDir: input.directory
-              });
-              await appendTrace(run.runId, "execution.validation", {
-                turn: turnNum,
-                tool: tc.function.name,
-                ok: validation.ok,
-                severity: validation.severity,
-                confidence: validation.confidence,
-                verificationType: validation.verificationType,
-                checks: validation.checks
-              });
-              await createVerificationArtifact({
-                runId: run.runId,
-                verificationType: validation.verificationType,
-                artifactType: "tool_result",
-                verificationResult: validation.ok ? "pass" : validation.severity === "warn" ? "warning" : "fail",
-                artifactContent: result.slice(0, 4000),
-                checks: validation.checks.map((check) => ({
-                  check,
-                  passed: validation.ok,
-                  severity: validation.severity === "error" ? "error" : validation.severity === "warn" ? "warn" : "info"
-                }))
-              });
-              if (!validation.ok) {
-                validationFailures += 1;
-              }
-              actionCount++;
-              await runHook(run.runId, "tool_result", {
-                turn: turnNum,
-                tool: tc.function.name,
-                ok: !result.startsWith("Error:")
-              }, projectConfig?.hooks, input.directory);
-            } catch (err) {
-              result = `Error: ${err instanceof Error ? err.message : "Unknown error"}`;
-            }
-            const toolDuration = Date.now() - toolStart;
-
-            emitRunStatus(run.runId, "executing", result.length > 200 ? result.slice(0, 200) + "..." : result, {
-              type: "tool_result", turn: turnNum, toolName: tc.function.name, duration: toolDuration, detail: result
-            });
-            await appendTrace(run.runId, "agent.tool_result", {
-              tool: tc.function.name,
-              result: result.slice(0, 4000),
-              turn: turnNum,
-              durationMs: toolDuration
-            });
-
-            messages.push({ role: "tool", tool_call_id: tc.id, content: result });
-          }
-          const checkpointState: PersistedExecutionState = {
-            runId: run.runId,
-            phase: "checkpointed",
-            phaseMarker: "executing",
-            turn: turnNum,
-            input,
-            stats: {
-              actionCount,
-              totalInputTokens,
-              totalOutputTokens,
-              retries: retryCount,
-              validationFailures,
-              safetyViolations
-            },
-            checkpoint: {
-              at: new Date().toISOString(),
-              reason: "openai.tool_result",
-              messageCount: messages.length
-            },
-            replayBoundary: createReplayBoundary(run.runId, turnNum, "openai.tool_result", messages.length)
-          };
-          await saveExecutionState(requestJson, run.runId, checkpointState);
-          await appendTrace(run.runId, "execution.checkpoint", { turn: turnNum, reason: "openai.tool_result" });
-          continue;
-        }
-
-        if (choice?.finish_reason === "stop" || toolCalls.length === 0) {
-          break;
-        }
+      // Process text
+      if (turnResult.textContent) {
+        allTextResponses.push(turnResult.textContent);
+        emitRunStatus(run.runId, "executing", turnResult.textContent.slice(0, 500), { type: "llm_text", turn, detail: turnResult.textContent });
+        appendThreadMessage(threadId, "assistant", turnResult.textContent, turn);
+        appendTrace(run.runId, "llm.text", { text: turnResult.textContent, turn });
       }
+
+      // Push assistant message to history
+      messages.push(turnResult.rawAssistantMessage);
+
+      // No tool calls = model is done
+      if (turnResult.toolCalls.length === 0) break;
+
+      // Handle ask_user separately (needs special prompt flow)
+      const askUserCalls = turnResult.toolCalls.filter(tc => tc.name === "ask_user");
+      const regularCalls = turnResult.toolCalls.filter(tc => tc.name !== "ask_user");
+
+      // Process ask_user calls first
+      const askResults: Array<{ id: string; content: string; isError: boolean }> = [];
+      for (const tc of askUserCalls) {
+        const question = String(tc.input.question ?? "").trim();
+        const prompt = await createUserPrompt({
+          runId: run.runId, threadId, turnNumber: turn,
+          promptText: question || "Please clarify the requirement.",
+          context: isRecord(tc.input) ? tc.input : {}
+        });
+        emitRunStatus(run.runId, "executing", prompt.promptText, { type: "ask_user", turn, promptId: prompt.promptId });
+        const answer = await waitForPromptAnswer(prompt.promptId, controller.signal);
+        askResults.push({ id: tc.id, content: `Operator answer: ${answer}`, isError: false });
+        appendThreadMessage(threadId, "user", `Q: ${prompt.promptText}
+A: ${answer}`, turn, { type: "ask_user_answer" });
+        appendTrace(run.runId, "ask_user.answered", { promptId: prompt.promptId, turn });
+      }
+
+      // Pre-execution: emit tool_call status + fire-and-forget trace writes
+      for (const tc of regularCalls) {
+        emitRunStatus(run.runId, "executing", describeToolCall(tc.name, tc.input as Record<string, unknown>), {
+          type: "tool_call", turn, toolName: tc.name,
+          toolInput: describeToolInput(tc.name, tc.input as Record<string, unknown>)
+        });
+        appendTrace(run.runId, "agent.tool_call", { tool: tc.name, input: tc.input, turn });
+      }
+
+      // Execute regular tools (parallel read-only, sequential mutating)
+      const toolResults = await executeToolCallsBatch(regularCalls, toolCtx);
+
+      // Post-execution: emit tool_result only (tool_call already emitted above)
+      for (const tr of toolResults) {
+        actionCount++;
+        emitRunStatus(run.runId, "executing",
+          tr.result.length > 200 ? tr.result.slice(0, 200) + "..." : tr.result,
+          { type: "tool_result", turn, toolName: tr.name, duration: tr.durationMs, detail: tr.result }
+        );
+        appendTrace(run.runId, "agent.tool_result", { tool: tr.name, result: tr.result.slice(0, 4000), turn, durationMs: tr.durationMs });
+      }
+
+      // Build tool result messages in correct format for the provider
+      const allResults = [
+        ...askResults,
+        ...toolResults.map(tr => ({ id: tr.id, content: smartTruncate(tr.result, 15_000), isError: tr.result.startsWith("Error:") }))
+      ];
+      const resultMessages = buildToolResultMessages(provider.kind, allResults);
+      for (const msg of resultMessages) messages.push(msg);
+
+      // Checkpoint — fire-and-forget; next turn doesn't depend on it
+      void saveExecutionState(requestJson, run.runId, {
+        runId: run.runId, phase: "checkpointed", phaseMarker: "executing",
+        turn, input,
+        stats: { actionCount, totalInputTokens, totalOutputTokens, retries: retryCount, validationFailures, safetyViolations },
+        checkpoint: { at: new Date().toISOString(), reason: "tool_result", messageCount: messages.length },
+        replayBoundary: createReplayBoundary(run.runId, turn, "tool_result", messages.length)
+      }).catch(() => undefined);
     }
 
-    // 5. Reflection turn before finalize
-    const draftResponse = allTextResponses.join("\n\n");
-    const reflectionText = await runReflectionTurn({
-      providerKind: provider.kind,
-      baseUrl: provider.baseUrl,
-      apiKey,
-      model: modelName,
-      objective: input.objective,
-      draftResponse,
-      maxTokens: Math.min(1200, maxTokens)
-    });
-    const reflectionNotes = parseReflectionNotes(reflectionText);
-    emitRunStatus(run.runId, "executing", "Reflection completed.", {
-      type: "reflection",
-      detail: reflectionText,
-      reflectionNotes
-    });
-    await appendTrace(run.runId, "execution.reflection", { reflectionText, reflectionNotes });
-    await runHook(run.runId, "reflection", { notes: reflectionNotes.length }, projectConfig?.hooks, input.directory);
-    await appendThreadMessage(threadId, "assistant", reflectionText, MAX_AGENT_TURNS + 1, { type: "reflection" });
-
-    // 6. Finalize
+    // 5. Finalize
     const totalDuration = Date.now() - runStartTime;
-    const finalResponse = [draftResponse, reflectionNotes.length > 0 ? `\n\nReflection notes:\n- ${reflectionNotes.join("\n- ")}` : ""]
-      .join("")
-      .trim();
+    const finalResponse = allTextResponses.join("\n\n").trim();
     const estimatedCostUsd = Number((((totalInputTokens / 1_000_000) * 0.2) + ((totalOutputTokens / 1_000_000) * 0.8)).toFixed(6));
     const expectedFragments = input.objective.trim() ? [input.objective.trim().split(/\s+/)[0] as string] : [];
     const evaluation = scoreExecution({
@@ -1484,54 +1385,47 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
       expectedContains: expectedFragments,
       latencyMs: totalDuration,
       outputTokens: totalOutputTokens,
-      maxLatencyMs: 45_000,
+      maxLatencyMs: 120_000,
       maxTokens,
       safetyViolations
     });
-    await appendTrace(run.runId, "llm.response", {
+    // Fire all finalization traces in parallel (non-blocking writes)
+    const baseline = baselineByRoutingMode.get(routingMode) ?? evaluation.aggregateScore;
+    baselineByRoutingMode.set(routingMode, Math.max(baseline, evaluation.aggregateScore));
+    const verificationPassRate = Math.max(0, actionCount - validationFailures) / Math.max(1, actionCount);
+
+    appendTrace(run.runId, "llm.response", {
       responseLength: finalResponse.length, actionCount, response: finalResponse,
       totalInputTokens, totalOutputTokens, totalDuration, retries: retryCount, estimatedCostUsd
     });
-    await appendTrace(run.runId, "eval.score", evaluation as unknown as Record<string, unknown>);
-    await appendTrace(run.runId, "execution.quality", {
-      safetyViolations,
-      validationFailures
-    });
-    const baseline = baselineByRoutingMode.get(routingMode) ?? evaluation.aggregateScore;
-    baselineByRoutingMode.set(routingMode, Math.max(baseline, evaluation.aggregateScore));
-    await appendTrace(run.runId, "eval.optimization", {
-      routingMode,
-      baselineScore: baseline,
-      candidateScore: evaluation.aggregateScore,
-      improved: evaluation.aggregateScore > baseline
-    });
-    const verificationPassRate = Math.max(0, actionCount - validationFailures) / Math.max(1, actionCount);
-    await recordPromotionEvaluation({
-      runId: run.runId,
-      criterionId: "default-v1",
-      aggregateScore: evaluation.aggregateScore,
-      safetyViolations,
-      verificationPassRate,
-      latencyMs: totalDuration,
-      estimatedCostUsd,
-      reason: `aggregate=${evaluation.aggregateScore.toFixed(3)} safety=${safetyViolations} verificationPassRate=${verificationPassRate.toFixed(3)}`
-    });
-    await recordModelPerformance({
-      providerId: provider.id,
-      model: modelName,
-      routingMode,
-      success: true,
-      latencyMs: totalDuration,
-      estimatedCostUsd,
-      aggregateScore: evaluation.aggregateScore
+    appendTrace(run.runId, "eval.score", evaluation as unknown as Record<string, unknown>);
+    appendTrace(run.runId, "execution.quality", { safetyViolations, validationFailures });
+    appendTrace(run.runId, "eval.optimization", {
+      routingMode, baselineScore: baseline,
+      candidateScore: evaluation.aggregateScore, improved: evaluation.aggregateScore > baseline
     });
 
+    // These HTTP calls can also run in parallel
     const summary = input.objective.slice(0, 200);
-    await requestJson(`/api/runs/${encodeURIComponent(run.runId)}`, {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status: "completed", summary })
-    });
+    await Promise.all([
+      recordPromotionEvaluation({
+        runId: run.runId, criterionId: "default-v1",
+        aggregateScore: evaluation.aggregateScore, safetyViolations, verificationPassRate,
+        latencyMs: totalDuration, estimatedCostUsd,
+        reason: `aggregate=${evaluation.aggregateScore.toFixed(3)} safety=${safetyViolations} verificationPassRate=${verificationPassRate.toFixed(3)}`
+      }),
+      recordModelPerformance({
+        providerId: provider.id, model: modelName, routingMode,
+        success: true, latencyMs: totalDuration, estimatedCostUsd,
+        aggregateScore: evaluation.aggregateScore
+      }),
+      requestJson(`/api/runs/${encodeURIComponent(run.runId)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "completed", summary })
+      }),
+      flushTraces() // drain all pending trace + thread writes
+    ]);
 
     const turnsUsed = Math.max(1, ...allTextResponses.map((_, i) => i + 1));
     const totalTokens = totalInputTokens + totalOutputTokens;
@@ -1545,72 +1439,58 @@ ${context.promptContext ? `## Selected Context\n${context.promptContext}` : "## 
     });
     emitRunStatus(run.runId, "completed", "Suggested next steps ready.", {
       type: "follow_up",
-      followUpActions: buildFollowUpActions(input.objective, reflectionNotes)
+      followUpActions: buildFollowUpActions(input.objective, [])
     });
-    await saveExecutionState(requestJson, run.runId, {
-      runId: run.runId,
-      phase: "completed",
-      phaseMarker: "finalizing",
-      turn: MAX_AGENT_TURNS,
-      input,
-      stats: {
-        actionCount,
-        totalInputTokens,
-        totalOutputTokens,
-        retries: retryCount,
-        validationFailures,
-        safetyViolations
-      }
-    });
-    await clearExecutionState(requestJson, run.runId);
-    await runHook(run.runId, "on_complete", {
-      actionCount,
-      turns: turnsUsed,
-      totalInputTokens,
-      totalOutputTokens,
-      duration: totalDuration
-    }, projectConfig?.hooks, input.directory);
+    await Promise.all([
+      saveExecutionState(requestJson, run.runId, {
+        runId: run.runId, phase: "completed", phaseMarker: "finalizing",
+        turn: MAX_AGENT_TURNS, input,
+        stats: { actionCount, totalInputTokens, totalOutputTokens, retries: retryCount, validationFailures, safetyViolations }
+      }),
+      clearExecutionState(requestJson, run.runId),
+      runHook(run.runId, "on_complete", {
+        actionCount, turns: turnsUsed, totalInputTokens, totalOutputTokens, duration: totalDuration
+      }, projectConfig?.hooks, input.directory)
+    ]);
     lifecycle.transition("idle");
     activeRunControllers.delete(run.runId);
     return { run, execution: { status: "executed", reason: finalResponse } };
 
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown execution error";
-    await appendTrace(run.runId, "run.error", { error: message });
-    await requestJson(`/api/runs/${encodeURIComponent(run.runId)}`, {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status: "failed", summary: message })
-    });
-    await saveExecutionState(requestJson, run.runId, {
-      runId: run.runId,
-      phase: message.includes("aborted") ? "aborted" : "failed",
-      phaseMarker: "finalizing",
-      turn: 0,
-      input,
-      stats: {
-        actionCount: 0,
-        totalInputTokens: 0,
-        totalOutputTokens: 0,
-        retries: 0,
-        validationFailures: 0,
-        safetyViolations: 0
-      },
-      lastError: message
-    });
-    const mode = (await requestJson("/api/settings").catch(() => ({ routingMode: "balanced" }))) as { routingMode?: "balanced" | "latency" | "quality" | "cost" };
+    appendTrace(run.runId, "run.error", { error: message });
+    // Parallelize error-path HTTP calls
+    const errorWrites: Promise<unknown>[] = [
+      requestJson(`/api/runs/${encodeURIComponent(run.runId)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "failed", summary: message })
+      }),
+      saveExecutionState(requestJson, run.runId, {
+        runId: run.runId,
+        phase: message.includes("aborted") ? "aborted" : "failed",
+        phaseMarker: "finalizing",
+        turn: 0,
+        input,
+        stats: {
+          actionCount: 0, totalInputTokens: 0, totalOutputTokens: 0,
+          retries: 0, validationFailures: 0, safetyViolations: 0
+        },
+        lastError: message
+      }),
+      flushTraces()
+    ];
     const failedInput = runInputs.get(run.runId);
     if (failedInput?.providerId) {
-      await recordModelPerformance({
+      const mode = (await requestJson("/api/settings").catch(() => ({ routingMode: "balanced" }))) as { routingMode?: "balanced" | "latency" | "quality" | "cost" };
+      errorWrites.push(recordModelPerformance({
         providerId: failedInput.providerId,
         model: "unknown",
         routingMode: mode.routingMode ?? "balanced",
-        success: false,
-        latencyMs: 0,
-        estimatedCostUsd: 0,
-        aggregateScore: 0
-      });
+        success: false, latencyMs: 0, estimatedCostUsd: 0, aggregateScore: 0
+      }));
     }
+    await Promise.all(errorWrites).catch(() => undefined);
     emitRunStatus(run.runId, lifecycle.transition("failed"), message, { type: "error" });
     lifecycle.transition("idle");
     activeRunControllers.delete(run.runId);
@@ -1625,10 +1505,7 @@ function describeToolCall(name: string, input: Record<string, unknown>): string 
     case "read_file": return `Reading file: ${input.path ?? "unknown"}`;
     case "search_code": return `Searching code: ${input.query ?? ""}`;
     case "glob_files": return `Globbing files: ${input.pattern ?? "*"}`;
-    case "git_status": return "Checking git status";
-    case "git_diff": return `Checking git diff${input.staged === true ? " (staged)" : ""}`;
-    case "git_add": return `Staging: ${input.pathspec ?? ""}`;
-    case "git_commit": return "Creating commit";
+    case "agent_notes": return `Notes: ${input.action ?? "read"}`;
     case "run_command": return `Running: ${input.command ?? "unknown"}`;
     case "list_directory": return `Listing: ${input.path ?? "."}`;
     default: return `Calling ${name}`;
@@ -1646,6 +1523,10 @@ async function selectModelByRouting(
   mode: "balanced" | "latency" | "quality" | "cost",
   providerId: string
 ): Promise<string> {
+  // For quality and balanced modes, always use the configured model — never downgrade
+  if (mode === "quality" || mode === "balanced") return defaultModel;
+
+  // Only for latency/cost modes, consider performance-based alternatives
   const fallback = pickFallbackModel(defaultModel, mode);
   const stats = (await requestJson(`/api/model-performance/${encodeURIComponent(providerId)}/${mode}`).catch(() => [])) as Array<{
     model: string;
@@ -1655,14 +1536,10 @@ async function selectModelByRouting(
     avgCostUsd: number;
     avgScore: number;
   }>;
-  if (stats.length === 0) {
-    return fallback;
-  }
+  if (stats.length === 0) return fallback;
   const ranked = [...stats].sort((a, b) => rankModel(b, mode) - rankModel(a, mode));
   const top = ranked[0];
-  if (!top || top.sampleSize < 3) {
-    return fallback;
-  }
+  if (!top || top.sampleSize < 3) return fallback;
   return top.model;
 }
 
@@ -1730,10 +1607,7 @@ function describeToolInput(name: string, input: Record<string, unknown>): string
     case "read_file": return String(input.path ?? "");
     case "search_code": return String(input.query ?? "").slice(0, 120);
     case "glob_files": return String(input.pattern ?? "");
-    case "git_status": return "";
-    case "git_diff": return input.staged === true ? "--staged" : "";
-    case "git_add": return String(input.pathspec ?? "");
-    case "git_commit": return "message=<provided>";
+    case "agent_notes": return String(input.action ?? "read");
     case "run_command": return String(input.command ?? "").slice(0, 120);
     case "list_directory": return String(input.path ?? ".");
     default: return JSON.stringify(input).slice(0, 100);
@@ -1823,6 +1697,8 @@ function createStdioMcpAdapter(config: {
 }, projectDir: string): RegisteredMcpAdapter {
   let childProcess: ReturnType<typeof spawn> | null = null;
   let requestId = 0;
+  let initialized = false;
+  let initializePromise: Promise<void> | null = null;
   const pendingRequests = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 
   function ensureProcess(): ReturnType<typeof spawn> {
@@ -1862,6 +1738,8 @@ function createStdioMcpAdapter(config: {
       for (const p of pendingRequests.values()) p.reject(new Error("MCP process exited"));
       pendingRequests.clear();
       childProcess = null;
+      initialized = false;
+      initializePromise = null;
     });
     return childProcess;
   }
@@ -1882,9 +1760,42 @@ function createStdioMcpAdapter(config: {
     });
   }
 
+  function sendNotification(method: string, params?: Record<string, unknown>): void {
+    const proc = ensureProcess();
+    const msg = JSON.stringify({ jsonrpc: "2.0", method, params: params ?? {} });
+    proc.stdin!.write(msg + "\n");
+  }
+
+  async function ensureInitialized(): Promise<void> {
+    if (initialized) return;
+    if (initializePromise) return initializePromise;
+    initializePromise = (async () => {
+      await sendRequest("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "autoagent-desktop", version: "0.1.0" }
+      });
+      sendNotification("notifications/initialized");
+      initialized = true;
+    })();
+    return initializePromise;
+  }
+
+  function killProcess(): void {
+    if (childProcess && !childProcess.killed) {
+      childProcess.kill("SIGTERM");
+      childProcess = null;
+    }
+    for (const p of pendingRequests.values()) p.reject(new Error("MCP adapter destroyed"));
+    pendingRequests.clear();
+    initialized = false;
+    initializePromise = null;
+  }
+
   return {
     id: config.id,
     async listTools() {
+      await ensureInitialized();
       const result = await sendRequest("tools/list") as { tools?: Array<{ name: string; description: string; inputSchema?: Record<string, unknown> }> };
       return (result?.tools ?? []).map((t) => ({
         name: t.name,
@@ -1893,10 +1804,12 @@ function createStdioMcpAdapter(config: {
       }));
     },
     async invokeTool(name: string, input: Record<string, unknown>) {
+      await ensureInitialized();
       const result = await sendRequest("tools/call", { name, arguments: input }) as { content?: Array<{ text?: string }>; isError?: boolean };
       const text = result?.content?.map((c) => c.text ?? "").join("") ?? "";
       return { ok: !result?.isError, output: text };
-    }
+    },
+    destroy: killProcess
   };
 }
 
@@ -1910,57 +1823,61 @@ async function loadMcpAdaptersFromConfig(
     try {
       const adapter = createStdioMcpAdapter(server, projectDir);
       registerMcpAdapter(adapter);
-      await appendTrace(runId, "mcp.adapter_registered", { id: server.id, command: server.command });
+      appendTrace(runId, "mcp.adapter_registered", { id: server.id, command: server.command });
     } catch {
-      await appendTrace(runId, "mcp.adapter_failed", { id: server.id }).catch(() => undefined);
+      appendTrace(runId, "mcp.adapter_failed", { id: server.id });
     }
   }
 }
 
-async function compressMessagesWithLLM(
+async function compressIfNeeded(
   messages: AgentMessage[],
-  input: { maxMessages: number; summaryMaxChars: number },
-  llmCall: (prompt: string) => Promise<string>
+  providerKind: string,
+  baseUrl: string,
+  apiKey: string,
+  model: string
 ): Promise<void> {
-  if (messages.length <= input.maxMessages) return;
+  const estimated = estimateTokens(messages);
+  // Compress at ~80K estimated tokens (conservative for most 128K+ context models)
+  const threshold = 65_000;
+  if (estimated < threshold || messages.length < 6) return;
+
+  // Keep system prompt (index 0) and last 4 messages
   const head = messages[0];
   if (!head) return;
-  const keepCount = Math.max(6, Math.floor(input.maxMessages / 2));
-  const tail = messages.slice(-keepCount);
-  const compressible = messages.slice(1, Math.max(1, messages.length - tail.length));
-  if (compressible.length === 0) return;
+  const preserved = messages.slice(-4);
+  const toCompress = messages.slice(1, messages.length - 4);
+  if (toCompress.length < 2) return;
 
-  const transcript = compressible
+  const transcript = toCompress
     .map((msg) => {
-      if (msg.role === "tool") return `[tool_result] ${msg.content.slice(0, 800)}`;
       if (typeof msg.content === "string") return `[${msg.role}] ${msg.content.slice(0, 800)}`;
       return `[${msg.role}] <structured content>`;
     })
     .join("\n---\n")
     .slice(0, 6000);
 
-  const summaryPrompt = `Summarize this conversation history for an AI coding agent. Preserve: key decisions made, files created/modified, commands run and their outcomes, errors encountered, and current progress. Be concise but don't lose critical details.\n\n${transcript}`;
+  const summaryPrompt = `Summarize this conversation for an AI coding agent. Preserve: key decisions, files created/modified, commands run and outcomes, errors, current progress. Be concise.\n\n${transcript}`;
 
   let summary: string;
   try {
-    summary = await llmCall(summaryPrompt);
+    if (providerKind === "anthropic-compatible") {
+      summary = await runAnthropicChat({ baseUrl, apiKey, model, prompt: summaryPrompt, systemPrompt: "Summarize concisely.", maxTokens: 512 });
+    } else {
+      summary = await runOpenAiCompatibleChat({ baseUrl, apiKey, model, prompt: summaryPrompt, systemPrompt: "Summarize concisely.", maxTokens: 512 });
+    }
   } catch {
-    // Fallback to truncation if LLM call fails
-    summary = compressible
+    // Fallback: simple truncation
+    summary = toCompress
       .map((msg) => {
-        if (msg.role === "tool") return `[tool] ${msg.content.slice(0, 220)}`;
-        if (typeof msg.content === "string") return `[${msg.role}] ${msg.content.slice(0, 220)}`;
-        return `[${msg.role}] complex-content`;
+        if (typeof msg.content === "string") return `[${msg.role}] ${msg.content.slice(0, 200)}`;
+        return `[${msg.role}] <complex>`;
       })
       .join("\n")
-      .slice(0, input.summaryMaxChars);
+      .slice(0, 2400);
   }
 
-  const summaryMessage: AgentMessage = {
-    role: "system",
-    content: `Compressed conversation summary:\n${summary}`
-  };
-  messages.splice(0, messages.length, head, summaryMessage, ...tail);
+  messages.splice(0, messages.length, head, { role: "user", content: `[Previous conversation summary]\n${summary}` }, ...preserved);
 }
 
 
@@ -1975,7 +1892,7 @@ async function runHook(
   hookConfig?: HookConfig,
   projectDir?: string
 ): Promise<void> {
-  await appendTrace(runId, `hook.${event}`, payload).catch(() => undefined);
+  appendTrace(runId, `hook.${event}`, payload);
 
   const command = hookConfig?.[event];
   if (!command || !projectDir) return;
@@ -1993,7 +1910,7 @@ async function runHook(
     child.on("close", () => clearTimeout(killTimer));
     child.on("error", (err) => {
       clearTimeout(killTimer);
-      appendTrace(runId, `hook.${event}.error`, { error: err.message }).catch(() => undefined);
+      appendTrace(runId, `hook.${event}.error`, { error: err.message });
     });
   } catch {
     // Hook execution is best-effort
@@ -2299,105 +2216,6 @@ function findKeyFiles(dir: string): string[] {
   return found.slice(0, 15);
 }
 
-async function runPlanningTurn(input: {
-  providerKind: "openai-compatible" | "anthropic-compatible" | "custom";
-  baseUrl: string;
-  apiKey: string;
-  model: string;
-  objective: string;
-  contextTree: string;
-  maxTokens: number;
-}): Promise<string> {
-  const planningPrompt = `Create a concise execution plan in 3-6 numbered steps before coding.
-Include explicit verification steps.
-
-Task:
-${input.objective}
-
-Directory map:
-${input.contextTree}`;
-  if (input.providerKind === "anthropic-compatible") {
-    return runAnthropicChat({
-      baseUrl: input.baseUrl,
-      apiKey: input.apiKey,
-      model: input.model,
-      prompt: planningPrompt,
-      systemPrompt: "You are planning a safe, executable coding workflow. Return only the numbered plan.",
-      maxTokens: Math.min(1200, input.maxTokens)
-    });
-  }
-  return runOpenAiCompatibleChat({
-    baseUrl: input.baseUrl,
-    apiKey: input.apiKey,
-    model: input.model,
-    prompt: planningPrompt,
-    systemPrompt: "You are planning a safe, executable coding workflow. Return only the numbered plan.",
-    maxTokens: Math.min(1200, input.maxTokens)
-  });
-}
-
-async function runReflectionTurn(input: {
-  providerKind: "openai-compatible" | "anthropic-compatible" | "custom";
-  baseUrl: string;
-  apiKey: string;
-  model: string;
-  objective: string;
-  draftResponse: string;
-  maxTokens: number;
-}): Promise<string> {
-  const reflectionPrompt = `Review this execution result against the objective.
-Return:
-1) what is complete,
-2) what is missing or risky,
-3) the top 3 concrete next actions.
-
-Objective:
-${input.objective}
-
-Execution result:
-${input.draftResponse || "(no textual output)"}`;
-  if (input.providerKind === "anthropic-compatible") {
-    return runAnthropicChat({
-      baseUrl: input.baseUrl,
-      apiKey: input.apiKey,
-      model: input.model,
-      prompt: reflectionPrompt,
-      systemPrompt: "Be critical, concrete, and concise.",
-      maxTokens: Math.min(1200, input.maxTokens)
-    });
-  }
-  return runOpenAiCompatibleChat({
-    baseUrl: input.baseUrl,
-    apiKey: input.apiKey,
-    model: input.model,
-    prompt: reflectionPrompt,
-    systemPrompt: "Be critical, concrete, and concise.",
-    maxTokens: Math.min(1200, input.maxTokens)
-  });
-}
-
-function parsePlanSteps(planText: string): PlanStep[] {
-  const lines = planText
-    .split(/\r?\n/g)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const numbered = lines.filter((line) => /^(\d+[\).]|[-*])\s+/.test(line));
-  const source = numbered.length > 0 ? numbered : lines.slice(0, 6);
-  return source.map((line, index) => ({
-    stepNumber: index + 1,
-    description: line.replace(/^(\d+[\).]|[-*])\s+/, ""),
-    status: "pending"
-  }));
-}
-
-function parseReflectionNotes(reflectionText: string): string[] {
-  return reflectionText
-    .split(/\r?\n/g)
-    .map((line) => line.trim())
-    .filter((line) => /^[-*]\s+/.test(line) || /^\d+[\).]\s+/.test(line))
-    .map((line) => line.replace(/^([-*]|\d+[\).])\s+/, ""))
-    .slice(0, 8);
-}
 
 function buildFollowUpActions(objective: string, reflectionNotes: string[]): FollowUpAction[] {
   const firstNote = reflectionNotes[0] ?? "Address remaining gaps";
@@ -2437,19 +2255,20 @@ async function ensureRunThread(runId: string, preferredThreadId?: string): Promi
   return created.threadId;
 }
 
-async function appendThreadMessage(
+function appendThreadMessage(
   threadId: string,
   role: "system" | "user" | "assistant" | "tool",
   content: string,
   turnNumber: number,
   metadata?: Record<string, unknown>
-): Promise<void> {
+): void {
   if (!content.trim()) return;
-  await requestJson(`/api/threads/${encodeURIComponent(threadId)}/messages`, {
+  const p = requestJson(`/api/threads/${encodeURIComponent(threadId)}/messages`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ role, content: content.slice(0, 20_000), turnNumber, metadata })
   }).catch(() => undefined);
+  pendingTraces.push(p); // piggyback on trace flush
 }
 
 async function loadThreadMessages(threadId: string): Promise<Array<{ role: string; content: string; turnNumber: number }>> {
@@ -2539,12 +2358,21 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function appendTrace(runId: string, eventType: string, payload: Record<string, unknown>): Promise<void> {
-  await requestJson(`/api/traces/${encodeURIComponent(runId)}`, {
+// Pending trace writes — drained before finalization via flushTraces()
+const pendingTraces: Promise<unknown>[] = [];
+
+function appendTrace(runId: string, eventType: string, payload: Record<string, unknown>): void {
+  const p = requestJson(`/api/traces/${encodeURIComponent(runId)}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ eventType, payload })
-  });
+  }).catch(() => undefined); // traces are best-effort — never block execution
+  pendingTraces.push(p);
+}
+
+async function flushTraces(): Promise<void> {
+  const batch = pendingTraces.splice(0);
+  if (batch.length > 0) await Promise.all(batch);
 }
 
 async function ensureNoPendingApprovals(runId: string): Promise<void> {

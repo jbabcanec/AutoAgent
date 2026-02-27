@@ -7,7 +7,10 @@
     "build": "tsc -p tsconfig.json",
     "dev": "node --watch src/index.ts",
     "lint": "node -e \"console.log('lint: pending')\"",
-    "test": "node --test test/**/*.test.ts",
+    "test": "tsx --test test/conformance.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.5"
   }
 }

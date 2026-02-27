@@ -92,8 +92,7 @@ export class TraceStore {
       }
       if (trace.eventType === "llm.turn") {
         providerLatencyMs += numeric(trace.payload.durationMs);
-        tokenInput += numeric(trace.payload.inputTokens);
-        tokenOutput += numeric(trace.payload.outputTokens);
+        // tokenInput/tokenOutput removed — already totalled in llm.response
       }
       if (trace.eventType === "agent.tool_result") {
         toolLatencyMs += numeric(trace.payload.durationMs);

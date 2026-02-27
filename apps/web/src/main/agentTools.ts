@@ -1,5 +1,5 @@
 import { execSync, spawn } from "node:child_process";
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 // --- Tool Definitions (Anthropic format) ---
@@ -19,11 +19,13 @@ export const ANTHROPIC_TOOLS = [
   },
   {
     name: "read_file",
-    description: "Read the contents of a file. Returns the text content (capped at 32KB).",
+    description: "Read the contents of a file with line numbers. Returns numbered lines (capped at 200KB). Use offset/limit for large files.",
     input_schema: {
       type: "object" as const,
       properties: {
-        path: { type: "string" as const, description: "File path relative to the project directory" }
+        path: { type: "string" as const, description: "File path relative to the project directory" },
+        offset: { type: "number" as const, description: "Start reading from this line number (1-indexed, default: 1)" },
+        limit: { type: "number" as const, description: "Maximum number of lines to return (default: all up to size cap)" }
       },
       required: ["path"]
     }
@@ -41,21 +43,24 @@ export const ANTHROPIC_TOOLS = [
   },
   {
     name: "edit_file",
-    description: "Edit an existing file by applying string replacement.",
+    description: "Edit an existing file by replacing a range of lines. First use read_file to see line numbers, then specify the range to replace. Alternatively, use search/replace for exact string matching.",
     input_schema: {
       type: "object" as const,
       properties: {
         path: { type: "string" as const, description: "File path relative to the project directory" },
-        search: { type: "string" as const, description: "Exact text to search for" },
-        replace: { type: "string" as const, description: "Replacement text" },
-        replaceAll: { type: "boolean" as const, description: "Replace all matches instead of first match" }
+        start_line: { type: "number" as const, description: "First line number to replace (1-indexed, inclusive). Use with end_line." },
+        end_line: { type: "number" as const, description: "Last line number to replace (1-indexed, inclusive). Use with start_line." },
+        new_content: { type: "string" as const, description: "Replacement content for the specified line range. Can be more or fewer lines than the range." },
+        search: { type: "string" as const, description: "Exact text to search for (fallback mode, prefer line numbers)" },
+        replace: { type: "string" as const, description: "Replacement text (used with search)" },
+        replaceAll: { type: "boolean" as const, description: "Replace all matches instead of first match (only with search/replace)" }
       },
-      required: ["path", "search", "replace"]
+      required: ["path"]
     }
   },
   {
     name: "search_code",
-    description: "Search code/text within project files and return matching lines.",
+    description: "Search code/text within project files and return matching lines. Respects .gitignore.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -67,7 +72,7 @@ export const ANTHROPIC_TOOLS = [
   },
   {
     name: "glob_files",
-    description: "List files using a wildcard glob-like pattern.",
+    description: "List files using a wildcard glob-like pattern. Respects .gitignore.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -75,44 +80,6 @@ export const ANTHROPIC_TOOLS = [
         path: { type: "string" as const, description: "Optional relative base path" }
       },
       required: ["pattern"]
-    }
-  },
-  {
-    name: "git_status",
-    description: "Get git status for the current repository.",
-    input_schema: { type: "object" as const, properties: {}, required: [] }
-  },
-  {
-    name: "git_diff",
-    description: "Get git diff. Optionally include --staged.",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        staged: { type: "boolean" as const, description: "Use staged diff" }
-      },
-      required: []
-    }
-  },
-  {
-    name: "git_add",
-    description: "Stage file(s) in git index.",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        pathspec: { type: "string" as const, description: "Pathspec to stage, e.g. . or src/file.ts" }
-      },
-      required: ["pathspec"]
-    }
-  },
-  {
-    name: "git_commit",
-    description: "Create a git commit with message.",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        message: { type: "string" as const, description: "Commit message" }
-      },
-      required: ["message"]
     }
   },
   {
@@ -124,6 +91,18 @@ export const ANTHROPIC_TOOLS = [
         path: { type: "string" as const, description: "Directory path relative to the project directory. Use '.' for the project root." }
       },
       required: ["path"]
+    }
+  },
+  {
+    name: "agent_notes",
+    description: "Read or update your persistent scratchpad. Use to track progress, decisions, and state. Content persists even if conversation context is compressed.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        action: { type: "string" as const, enum: ["read", "append", "replace"], description: "read: get current notes, append: add to notes, replace: overwrite notes" },
+        content: { type: "string" as const, description: "Content to write (for append/replace)" }
+      },
+      required: ["action"]
     }
   },
   {
@@ -177,29 +156,17 @@ export function executeTool(
         projectDir
       );
     case "read_file":
-      return executeReadFile(String(input.path ?? ""), projectDir);
+      return executeReadFile(input, projectDir);
     case "run_command":
       return executeRunCommand(String(input.command ?? ""), projectDir);
     case "edit_file":
-      return executeEditFile(
-        String(input.path ?? ""),
-        String(input.search ?? ""),
-        String(input.replace ?? ""),
-        input.replaceAll === true,
-        projectDir
-      );
+      return executeEditFile(input, projectDir);
     case "search_code":
       return executeSearchCode(String(input.query ?? ""), String(input.path ?? "."), projectDir);
     case "glob_files":
       return executeGlobFiles(String(input.pattern ?? "*"), String(input.path ?? "."), projectDir);
-    case "git_status":
-      return executeRunCommand("git status --short --branch", projectDir);
-    case "git_diff":
-      return executeRunCommand(input.staged === true ? "git diff --staged" : "git diff", projectDir);
-    case "git_add":
-      return executeGitAdd(String(input.pathspec ?? ""), projectDir);
-    case "git_commit":
-      return executeGitCommit(String(input.message ?? ""), projectDir);
+    case "agent_notes":
+      return executeAgentNotes(input, projectDir);
     case "list_directory":
       return executeListDirectory(String(input.path ?? "."), projectDir);
     default:
@@ -226,15 +193,63 @@ function executeWriteFile(filePath: string, content: string, projectDir: string)
   return `File written: ${filePath} (${content.length} bytes)`;
 }
 
-function executeReadFile(filePath: string, projectDir: string): string {
+// --- read_file with line numbers, 200KB cap, and pagination ---
+
+function executeReadFile(input: Record<string, unknown>, projectDir: string): string {
+  const filePath = String(input.path ?? "").trim();
+  if (!filePath) return "Error: path is required";
   const resolved = resolveSafe(projectDir, filePath);
-  const MAX_SIZE = 32 * 1024;
+  const MAX_SIZE = 200 * 1024; // 200KB
+  const offset = typeof input.offset === "number" && input.offset >= 1 ? Math.floor(input.offset) : 1;
+  const limit = typeof input.limit === "number" && input.limit >= 1 ? Math.floor(input.limit) : Infinity;
+
   const stat = statSync(resolved);
-  const content = readFileSync(resolved, "utf8");
   if (stat.size > MAX_SIZE) {
-    return content.slice(0, MAX_SIZE) + "\n... (truncated)";
+    // Read only up to MAX_SIZE bytes to avoid loading huge files into memory
+    const fd = openSync(resolved, "r");
+    const buffer = Buffer.alloc(MAX_SIZE);
+    const bytesRead = readSync(fd, buffer, 0, MAX_SIZE, 0);
+    closeSync(fd);
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    const allLines = text.split("\n");
+    // Drop potentially partial last line from truncation
+    if (bytesRead === MAX_SIZE) allLines.pop();
+    return formatLinesWithNumbers(allLines, offset, limit, true);
   }
-  return content;
+
+  const content = readFileSync(resolved, "utf8");
+  const allLines = content.split("\n");
+  return formatLinesWithNumbers(allLines, offset, limit, false);
+}
+
+function formatLinesWithNumbers(
+  allLines: string[],
+  offset: number,
+  limit: number,
+  truncated: boolean
+): string {
+  const startIdx = offset - 1;
+  if (startIdx >= allLines.length) {
+    return `Error: offset ${offset} exceeds available lines (${allLines.length})`;
+  }
+  const endIdx = Math.min(startIdx + limit, allLines.length);
+  const selectedLines = allLines.slice(startIdx, endIdx);
+  const maxLineNum = offset + selectedLines.length - 1;
+  const gutterWidth = String(maxLineNum).length;
+
+  const numbered = selectedLines.map((line, i) => {
+    const lineNum = String(offset + i).padStart(gutterWidth, " ");
+    return `${lineNum} | ${line}`;
+  });
+
+  let result = numbered.join("\n");
+  if (endIdx < allLines.length) {
+    result += `\n... (${allLines.length - endIdx} more lines. Use offset=${endIdx + 1} to continue.)`;
+  }
+  if (truncated) {
+    result += "\n... (file truncated at 200KB)";
+  }
+  return result;
 }
 
 function executeRunCommand(command: string, projectDir: string): string {
@@ -269,19 +284,162 @@ function executeRunCommand(command: string, projectDir: string): string {
   }
 }
 
-function executeEditFile(filePath: string, search: string, replace: string, replaceAll: boolean, projectDir: string): string {
-  if (!filePath.trim()) return "Error: path is required";
-  if (!search) return "Error: search text cannot be empty";
+// --- edit_file with line-number-based editing (preferred) + string match (fallback) ---
+
+function executeEditFile(input: Record<string, unknown>, projectDir: string): string {
+  const filePath = String(input.path ?? "").trim();
+  if (!filePath) return "Error: path is required";
   const resolved = resolveSafe(projectDir, filePath);
+
+  const startLine = typeof input.start_line === "number" ? input.start_line : undefined;
+  const endLine = typeof input.end_line === "number" ? input.end_line : undefined;
+  const newContent = typeof input.new_content === "string" ? input.new_content : undefined;
+
+  // Line-number-based editing (preferred path)
+  if (startLine !== undefined && endLine !== undefined) {
+    if (startLine < 1) return "Error: start_line must be >= 1";
+    if (endLine < startLine) return "Error: end_line must be >= start_line";
+
+    const content = readFileSync(resolved, "utf8");
+    const lines = content.split("\n");
+    const totalLines = lines.length;
+
+    if (startLine > totalLines) return `Error: start_line ${startLine} exceeds file length (${totalLines} lines)`;
+    if (endLine > totalLines) return `Error: end_line ${endLine} exceeds file length (${totalLines} lines)`;
+
+    const before = lines.slice(0, startLine - 1);
+    const after = lines.slice(endLine);
+    const replacementLines = newContent !== undefined ? newContent.split("\n") : [];
+    const next = [...before, ...replacementLines, ...after].join("\n");
+    writeFileSync(resolved, next, "utf8");
+
+    const removedCount = endLine - startLine + 1;
+    const addedCount = replacementLines.length;
+    return `File edited: ${filePath} (replaced lines ${startLine}-${endLine}: removed ${removedCount}, added ${addedCount} lines)`;
+  }
+
+  // Legacy string-based editing (backwards compatibility)
+  const search = String(input.search ?? "");
+  const replace = String(input.replace ?? "");
+  const replaceAll = input.replaceAll === true;
+
+  if (!search) return "Error: either start_line/end_line or search/replace is required";
   const content = readFileSync(resolved, "utf8");
-  if (!content.includes(search)) return "Error: search text not found";
+  if (!content.includes(search)) return "Error: search text not found in file";
   const next = replaceAll ? content.split(search).join(replace) : content.replace(search, replace);
   writeFileSync(resolved, next, "utf8");
   return `File edited: ${filePath}`;
 }
 
+// --- .gitignore-aware search and glob ---
+
+const DEFAULT_IGNORE_DIRS = new Set([
+  "node_modules", ".git", "dist", "build", ".next", "out",
+  "coverage", "__pycache__", ".cache", ".vscode", ".idea",
+  "dist-main", "dist-renderer", ".pnpm", "target", "vendor"
+]);
+
+const DEFAULT_IGNORE_PATTERNS = [
+  /\.min\.js$/,
+  /\.min\.css$/,
+  /\.map$/,
+  /\.lock$/,
+  /package-lock\.json$/,
+  /\.DS_Store$/,
+  /Thumbs\.db$/
+];
+
+interface GitignoreRules {
+  patterns: Array<{ regex: RegExp; negated: boolean; dirOnly: boolean }>;
+}
+
+function parseGitignoreFile(content: string): GitignoreRules {
+  const patterns: GitignoreRules["patterns"] = [];
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    let negated = false;
+    let pattern = line;
+    if (pattern.startsWith("!")) {
+      negated = true;
+      pattern = pattern.slice(1);
+    }
+
+    const dirOnly = pattern.endsWith("/");
+    if (dirOnly) pattern = pattern.slice(0, -1);
+
+    if (pattern.startsWith("/")) pattern = pattern.slice(1);
+
+    const regex = gitignorePatternToRegex(pattern);
+    patterns.push({ regex, negated, dirOnly });
+  }
+  return { patterns };
+}
+
+function gitignorePatternToRegex(pattern: string): RegExp {
+  let output = "";
+  // If pattern has no slash, it matches basename anywhere in the tree
+  const matchesAnywhere = !pattern.includes("/");
+
+  if (matchesAnywhere) {
+    output += "(?:^|/)";
+  } else {
+    output += "^";
+  }
+
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i]!;
+    if (ch === "*") {
+      if (pattern[i + 1] === "*") {
+        if (pattern[i + 2] === "/") {
+          output += "(?:.*/)?";
+          i += 3;
+        } else {
+          output += ".*";
+          i += 2;
+        }
+      } else {
+        output += "[^/]*";
+        i += 1;
+      }
+    } else if (ch === "?") {
+      output += "[^/]";
+      i += 1;
+    } else {
+      output += escapeRegex(ch);
+      i += 1;
+    }
+  }
+  output += "(?:$|/)";
+  return new RegExp(output);
+}
+
+function loadGitignoreRules(projectDir: string): GitignoreRules {
+  try {
+    const content = readFileSync(path.join(projectDir, ".gitignore"), "utf8");
+    return parseGitignoreFile(content);
+  } catch {
+    return { patterns: [] };
+  }
+}
+
+function isGitignored(relativePath: string, isDir: boolean, rules: GitignoreRules): boolean {
+  const normalizedPath = relativePath.replaceAll("\\", "/");
+  let ignored = false;
+  for (const rule of rules.patterns) {
+    if (rule.dirOnly && !isDir) continue;
+    if (rule.regex.test(normalizedPath)) {
+      ignored = !rule.negated;
+    }
+  }
+  return ignored;
+}
+
 function executeSearchCode(query: string, relPath: string, projectDir: string): string {
   const base = resolveSafe(projectDir, relPath || ".");
+  const gitignoreRules = loadGitignoreRules(projectDir);
   let regex: RegExp;
   try {
     regex = new RegExp(query, "i");
@@ -291,7 +449,7 @@ function executeSearchCode(query: string, relPath: string, projectDir: string): 
   const results: string[] = [];
   scanFiles(base, (file) => {
     if (results.length >= 200) return;
-    if (shouldSkipFile(file)) return;
+    if (shouldSkipFile(file, projectDir, gitignoreRules)) return;
     try {
       const text = readFileSync(file, "utf8");
       const lines = text.split(/\r?\n/g);
@@ -304,7 +462,7 @@ function executeSearchCode(query: string, relPath: string, projectDir: string): 
     } catch {
       // ignore binary/unreadable files
     }
-  });
+  }, projectDir, gitignoreRules);
   return results.length > 0 ? results.join("\n") : "No matches found.";
 }
 
@@ -312,11 +470,12 @@ function executeGlobFiles(pattern: string, relPath: string, projectDir: string):
   const base = resolveSafe(projectDir, relPath || ".");
   const normalizedPattern = pattern.replaceAll("\\", "/");
   const regex = globToRegex(normalizedPattern);
+  const gitignoreRules = loadGitignoreRules(projectDir);
   const matches: string[] = [];
   scanFiles(base, (file) => {
     const rel = path.relative(projectDir, file).replaceAll("\\", "/");
     if (regex.test(rel)) matches.push(rel);
-  });
+  }, projectDir, gitignoreRules);
   return matches.slice(0, 500).join("\n") || "No files matched.";
 }
 
@@ -388,32 +547,53 @@ function escapeQuote(value: string): string {
   return value.replaceAll('"', '\\"');
 }
 
-function executeGitAdd(pathspec: string, projectDir: string): string {
-  const normalized = pathspec.trim();
-  if (!normalized) return "Error: pathspec is required";
-  if (/[;&|`$]/.test(normalized)) return "Error: invalid pathspec characters";
-  return executeRunCommand(`git add ${normalized}`, projectDir);
+function executeAgentNotes(input: Record<string, unknown>, projectDir: string): string {
+  const notesPath = path.join(projectDir, ".autoagent-notes.md");
+  const action = String(input.action ?? "read");
+  if (action === "read") {
+    try { return readFileSync(notesPath, "utf8") || "(empty)"; }
+    catch { return "(no notes yet)"; }
+  }
+  if (action === "append") {
+    const existing = (() => { try { return readFileSync(notesPath, "utf8"); } catch { return ""; } })();
+    writeFileSync(notesPath, existing + "\n" + String(input.content ?? ""), "utf8");
+    return "Notes updated.";
+  }
+  if (action === "replace") {
+    writeFileSync(notesPath, String(input.content ?? ""), "utf8");
+    return "Notes replaced.";
+  }
+  return "Error: action must be read, append, or replace";
 }
 
-function executeGitCommit(message: string, projectDir: string): string {
-  const normalized = message.trim();
-  if (!normalized) return "Error: commit message is required";
-  if (normalized.includes("\n")) return "Error: multiline commit messages are blocked";
-  return executeRunCommand(`git commit -m "${escapeQuote(normalized)}"`, projectDir);
-}
-
-function shouldSkipFile(filePath: string): boolean {
+function shouldSkipFile(filePath: string, projectDir: string, gitignoreRules: GitignoreRules): boolean {
   const normalized = filePath.replaceAll("\\", "/");
-  return normalized.includes("/node_modules/") || normalized.includes("/.git/");
+  if (normalized.includes("/node_modules/") || normalized.includes("/.git/")) return true;
+
+  for (const pattern of DEFAULT_IGNORE_PATTERNS) {
+    if (pattern.test(normalized)) return true;
+  }
+
+  const relativePath = path.relative(projectDir, filePath).replaceAll("\\", "/");
+  if (isGitignored(relativePath, false, gitignoreRules)) return true;
+
+  return false;
 }
 
-function scanFiles(root: string, onFile: (file: string) => void): void {
+function scanFiles(
+  root: string,
+  onFile: (file: string) => void,
+  projectDir: string,
+  gitignoreRules: GitignoreRules
+): void {
   const entries = readdirSync(root, { withFileTypes: true });
   for (const entry of entries) {
     const full = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
-      scanFiles(full, onFile);
+      if (DEFAULT_IGNORE_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+      const relDir = path.relative(projectDir, full).replaceAll("\\", "/");
+      if (isGitignored(relDir, true, gitignoreRules)) continue;
+      scanFiles(full, onFile, projectDir, gitignoreRules);
       continue;
     }
     onFile(full);

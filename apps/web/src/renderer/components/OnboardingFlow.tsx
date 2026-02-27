@@ -121,7 +121,7 @@ export function OnboardingFlow({
   }
 
   async function completeOnboarding(): Promise<void> {
-    const trialCompleted = chatCompleted && repoCompleted ? "both" : chatCompleted ? "chat" : "repo";
+    const trialCompleted = chatCompleted && repoCompleted ? "both" : chatCompleted ? "chat" : repoCompleted ? "repo" : "chat";
     await onComplete(trialCompleted);
   }
 
@@ -223,9 +223,17 @@ export function OnboardingFlow({
                   return output;
                 }}
               />
-              <Button className="w-full" onClick={() => setStep(3)} disabled={!chatCompleted && !repoCompleted}>
-                Continue
-              </Button>
+              <div className="flex flex-col gap-2">
+                <Button className="w-full" onClick={() => setStep(3)} disabled={!chatCompleted && !repoCompleted}>
+                  Continue
+                </Button>
+                <button
+                  className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground transition-colors"
+                  onClick={() => setStep(3)}
+                >
+                  Skip tests
+                </button>
+              </div>
             </div>
           ) : null}
 

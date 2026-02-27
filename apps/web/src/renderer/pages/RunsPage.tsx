@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { EmptyState } from "../components/EmptyState";
 import { AgentExecutionView, type SessionStats } from "../components/AgentExecutionView";
+import { Markdown } from "../components/Markdown";
 import { cn } from "@/lib/utils";
 
 const STATUS_VARIANT: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
@@ -98,22 +99,20 @@ export function RunsPage({
 
   return (
     <div className="space-y-2">
-      {/* Placeholder card while run is being created but not yet in the list */}
-      {isExecuting && runs.length === 0 && (
+      {/* Placeholder card while run is executing but not yet in the list */}
+      {isExecuting && liveSteps.length > 0 && !runs.some((r) => r.runId === liveSteps[0]?.runId) && (
         <Card className="ring-1 ring-primary/30">
           <CardContent className="p-0">
             <div className="flex items-center gap-3 px-4 py-3">
               <span className="h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
               <div className="flex-1">
-                <p className="text-sm font-medium">Starting task...</p>
+                <p className="text-sm font-medium">Running task...</p>
               </div>
-              <Badge variant="default">creating</Badge>
+              <Badge variant="default">executing</Badge>
             </div>
-            {liveSteps.length > 0 && (
-              <div className="border-t">
-                <AgentExecutionView steps={liveSteps} sessionStats={sessionStats} isExecuting={true} />
-              </div>
-            )}
+            <div className="border-t">
+              <AgentExecutionView steps={liveSteps} sessionStats={sessionStats} isExecuting={true} />
+            </div>
           </CardContent>
         </Card>
       )}
@@ -270,6 +269,33 @@ function TaskCard({
     });
   }, [isActiveRun, liveSteps, isExpanded, traces, run.runId]);
 
+  // Extract eval.score data from traces
+  const scoreData = useMemo(() => {
+    const evalTrace = traces.find((t) => t.eventType === "eval.score");
+    if (!evalTrace) return null;
+    const aggregate = typeof evalTrace.payload.aggregateScore === "number" ? evalTrace.payload.aggregateScore : null;
+    if (aggregate === null) return null;
+    return {
+      aggregate,
+      correctness: typeof evalTrace.payload.correctnessScore === "number" ? evalTrace.payload.correctnessScore : null,
+      latency: typeof evalTrace.payload.latencyScore === "number" ? evalTrace.payload.latencyScore : null,
+      cost: typeof evalTrace.payload.costScore === "number" ? evalTrace.payload.costScore : null,
+      safety: typeof evalTrace.payload.safetyScore === "number" ? evalTrace.payload.safetyScore : null,
+    };
+  }, [traces]);
+
+  // Extract working directory from context.retrieval trace
+  const workingDir = useMemo(() => {
+    const ctxTrace = traces.find((t) => t.eventType === "context.retrieval");
+    return typeof ctxTrace?.payload.directory === "string" ? ctxTrace.payload.directory : null;
+  }, [traces]);
+
+  // Extract execution duration from llm.response trace
+  const durationMs = useMemo(() => {
+    const llmTrace = traces.find((t) => t.eventType === "llm.response");
+    return typeof llmTrace?.payload.totalDuration === "number" ? llmTrace.payload.totalDuration : null;
+  }, [traces]);
+
   // Build stats from traces for historical runs
   const displayStats = useMemo((): SessionStats => {
     if (isActiveRun) return sessionStats;
@@ -324,10 +350,18 @@ function TaskCard({
             <p className="text-sm font-medium leading-none truncate">
               {run.summary ?? run.runId}
             </p>
+            {isExpanded && workingDir && (
+              <p className="text-xs text-muted-foreground font-mono truncate mt-0.5">{workingDir}</p>
+            )}
           </div>
           <Badge variant={STATUS_VARIANT[run.status] ?? "outline"} className="shrink-0">
             {run.status.replaceAll("_", " ")}
           </Badge>
+          {scoreData && (
+            <span className={cn("text-xs px-1.5 py-0.5 rounded font-mono shrink-0", scoreBadgeClass(scoreData.aggregate))}>
+              {scoreData.aggregate.toFixed(2)}{scoreData.aggregate >= 0.75 ? " \u2713" : ""}
+            </span>
+          )}
           <span className="text-xs text-muted-foreground shrink-0 flex items-center gap-1">
             <Clock className="h-3 w-3" />
             {formatRelativeTime(run.updatedAt)}
@@ -355,18 +389,31 @@ function TaskCard({
 
             {/* Actions */}
             <div className="flex justify-end px-4 pb-3 pt-1 border-t">
-              <div className="mr-auto text-xs text-muted-foreground flex items-center gap-3">
-                <span>Tokens: {metrics?.tokenTotal ?? 0}</span>
-                <span>Retries: {metrics?.retries ?? 0}</span>
-                <span>
-                  Retry classes: t={metrics?.transientRetries ?? 0} p={metrics?.providerRetries ?? 0} tool={metrics?.toolRetries ?? 0} pol=
-                  {metrics?.policyRetries ?? 0}
-                </span>
-                <span>Verify: {metrics?.verificationPassed ?? 0}/{(metrics?.verificationPassed ?? 0) + (metrics?.verificationFailed ?? 0)}</span>
-                <span>Egress denied: {metrics?.egressDenied ?? 0}</span>
-                <span>Plan/reflect: {metrics?.planningEvents ?? 0}/{metrics?.reflectionEvents ?? 0}</span>
-                <span>Cache h/m: {metrics?.cacheHits ?? 0}/{metrics?.cacheMisses ?? 0}</span>
-                <span>Cost: ${metrics?.estimatedCostUsd?.toFixed(4) ?? "0.0000"}</span>
+              <div className="mr-auto text-xs text-muted-foreground flex items-center gap-1.5 font-mono flex-wrap">
+                {displayStats.model && (
+                  <><span>{displayStats.model.split("/").pop()?.split(":")[0] ?? displayStats.model}</span><span className="opacity-40">·</span></>
+                )}
+                <span>{formatTokensShort(metrics?.tokenTotal ?? 0)} tok</span>
+                <span className="opacity-40">·</span>
+                <span>{displayStats.totalActions} actions</span>
+                <span className="opacity-40">·</span>
+                <span>${metrics?.estimatedCostUsd?.toFixed(4) ?? "0.0000"}</span>
+                {scoreData && (
+                  <>
+                    <span className="opacity-40">·</span>
+                    <span className={cn("px-1 rounded", scoreBadgeClass(scoreData.aggregate))}>
+                      Score: {scoreData.aggregate.toFixed(2)}
+                      {" ["}C:{scoreData.correctness?.toFixed(1) ?? "-"}
+                      {" L:"}{scoreData.latency?.toFixed(1) ?? "-"}
+                      {" Q:"}{scoreData.cost?.toFixed(1) ?? "-"}
+                      {" S:"}{scoreData.safety?.toFixed(1) ?? "-"}
+                      {"]"}
+                    </span>
+                  </>
+                )}
+                {durationMs !== null && (
+                  <><span className="opacity-40">·</span><span>{Math.round(durationMs / 1000)}s</span></>
+                )}
               </div>
               <div className="flex items-center gap-2">
                 <Button variant="outline" size="sm" className="h-7 text-xs" onClick={onResume}>
@@ -469,14 +516,26 @@ function ResponseView({ content }: { content: string }): React.JSX.Element {
       </div>
       <div
         className={cn(
-          "bg-muted/30 border rounded-md p-4 text-sm leading-relaxed whitespace-pre-wrap break-words overflow-auto transition-[max-height] duration-300 ease-in-out",
+          "bg-muted/30 border rounded-md p-4 text-sm leading-relaxed overflow-auto transition-[max-height] duration-300 ease-in-out",
           expanded ? "max-h-[600px]" : "max-h-48"
         )}
       >
-        {content}
+        <Markdown>{content}</Markdown>
       </div>
     </div>
   );
+}
+
+function scoreBadgeClass(score: number): string {
+  if (score >= 0.75) return "bg-green-500/10 text-green-700 border border-green-500/30";
+  if (score >= 0.6) return "bg-yellow-500/10 text-yellow-700 border border-yellow-500/30";
+  return "bg-red-500/10 text-red-700 border border-red-500/30";
+}
+
+function formatTokensShort(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
+  return `${Math.round(n / 1000)}k`;
 }
 
 function summarizePayload(payload: Record<string, unknown>): string {

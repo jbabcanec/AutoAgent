@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, ChevronDown, ChevronRight, File, FolderOpen, Terminal, XCircle } from "lucide-react";
 import type { RunStatusEvent } from "../../shared/ipc.js";
 import { cn } from "@/lib/utils";
+import { Markdown } from "./Markdown";
 
 // --- Types ---
 
@@ -186,7 +187,12 @@ function TurnGroup({ turn }: { turn: TurnData }): React.JSX.Element {
 
   const toolCalls = turn.events.filter((e) => e.type === "tool_call");
   const toolResults = turn.events.filter((e) => e.type === "tool_result");
-  const llmTexts = turn.events.filter((e) => e.type === "llm_text" || e.type === "llm_delta");
+  const llmTextEvents = turn.events.filter((e) => e.type === "llm_text");
+
+  // For active turns: accumulate streaming deltas into one live text block
+  const liveText = turn.isActive
+    ? turn.events.filter((e) => e.type === "llm_delta").map((e) => e.detail ?? e.message).join("")
+    : null;
 
   // Pair tool calls with their results
   const toolPairs: Array<{ call: RunStatusEvent; result: RunStatusEvent | null }> = toolCalls.map((call, i) => ({
@@ -230,8 +236,11 @@ function TurnGroup({ turn }: { turn: TurnData }): React.JSX.Element {
       {/* Turn Content */}
       {!collapsed && (
         <div className="px-3 pb-2 space-y-1">
-          {/* LLM text blocks */}
-          {llmTexts.map((evt, i) => (
+          {/* Live streaming text (active turn only — single accumulated block) */}
+          {liveText && <LiveTextBlock text={liveText} />}
+
+          {/* Completed LLM text blocks (never show raw deltas) */}
+          {!liveText && llmTextEvents.map((evt, i) => (
             <LlmTextBlock key={`llm-${evt.timestamp}-${i}`} event={evt} />
           ))}
 
@@ -241,6 +250,17 @@ function TurnGroup({ turn }: { turn: TurnData }): React.JSX.Element {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// --- Live Streaming Text Block (active turn, accumulated deltas) ---
+
+function LiveTextBlock({ text }: { text: string }): React.JSX.Element {
+  return (
+    <div className="border-l-2 border-blue-500/40 pl-3 py-1 text-xs text-zinc-400 leading-relaxed">
+      <Markdown>{text}</Markdown>
+      <span className="inline-block w-1.5 h-3 bg-blue-400 animate-pulse ml-0.5 align-text-bottom" />
     </div>
   );
 }
@@ -257,12 +277,12 @@ function LlmTextBlock({ event }: { event: RunStatusEvent }): React.JSX.Element {
     <div className="group">
       <div
         className={cn(
-          "border-l-2 border-zinc-700 pl-3 py-1 text-xs text-zinc-300 whitespace-pre-wrap break-words leading-relaxed",
+          "border-l-2 border-zinc-700 pl-3 py-1 text-xs text-zinc-300 leading-relaxed",
           isLong && "cursor-pointer"
         )}
         onClick={isLong ? () => setExpanded(!expanded) : undefined}
       >
-        {displayText}
+        <Markdown>{displayText}</Markdown>
         {isLong && !expanded && (
           <span className="text-zinc-600 ml-1 text-[10px]">[click to expand]</span>
         )}

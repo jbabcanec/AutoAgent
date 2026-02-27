@@ -8,6 +8,7 @@ export interface RegisteredMcpAdapter {
   id: string;
   listTools: () => Promise<McpToolDescriptor[]>;
   invokeTool: (name: string, input: Record<string, unknown>) => Promise<{ ok: boolean; output: string }>;
+  destroy?: () => void;
 }
 
 const adapters = new Map<string, RegisteredMcpAdapter>();
@@ -25,6 +26,11 @@ export function getMcpAdapter(id: string): RegisteredMcpAdapter | undefined {
 }
 
 export function clearMcpAdapters(): void {
+  for (const adapter of adapters.values()) {
+    if (typeof adapter.destroy === "function") {
+      adapter.destroy();
+    }
+  }
   adapters.clear();
 }
 

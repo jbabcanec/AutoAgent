@@ -67,9 +67,18 @@ export class RunStore {
   }
 
   public delete(runId: string): boolean {
-    const result = this.db.prepare("DELETE FROM runs WHERE run_id = ?").run(runId);
-    this.db.prepare("DELETE FROM traces WHERE run_id = ?").run(runId);
-    return result.changes > 0;
+    const del = this.db.transaction((rid: string) => {
+      this.db.prepare("DELETE FROM conversation_messages WHERE thread_id IN (SELECT thread_id FROM conversation_threads WHERE run_id = ?)").run(rid);
+      this.db.prepare("DELETE FROM conversation_threads WHERE run_id = ?").run(rid);
+      this.db.prepare("DELETE FROM approvals WHERE run_id = ?").run(rid);
+      this.db.prepare("DELETE FROM verification_artifacts WHERE run_id = ?").run(rid);
+      this.db.prepare("DELETE FROM user_prompts WHERE run_id = ?").run(rid);
+      this.db.prepare("DELETE FROM promotion_evaluations WHERE run_id = ?").run(rid);
+      this.db.prepare("DELETE FROM execution_state WHERE run_id = ?").run(rid);
+      this.db.prepare("DELETE FROM traces WHERE run_id = ?").run(rid);
+      return this.db.prepare("DELETE FROM runs WHERE run_id = ?").run(rid);
+    });
+    return del(runId).changes > 0;
   }
 
   public create(input: Pick<RunItem, "projectId"> & { objective: string }): RunItem {

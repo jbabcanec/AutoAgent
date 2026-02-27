@@ -115,7 +115,11 @@ export function App(): React.JSX.Element {
       setState((prev) => ({
         ...prev,
         status: event.state,
-        logs: [`${formatEvent(event)}`, ...prev.logs].slice(0, 40)
+        logs: [`${formatEvent(event)}`, ...prev.logs].slice(0, 40),
+        // Auto-expand the run card as soon as the first executing event arrives
+        expandedRunId: prev.expandedRunId === null && event.state === "executing"
+          ? event.runId
+          : prev.expandedRunId
       }));
       setLiveSteps((prev) => [...prev.slice(-99), event]);
       if (event.state === "completed" && event.detail) {
@@ -204,6 +208,7 @@ export function App(): React.JSX.Element {
     await window.autoagent.deleteRun(runId);
     setState((prev) => ({
       ...prev,
+      runs: prev.runs.filter((r) => r.runId !== runId),
       expandedRunId: prev.expandedRunId === runId ? null : prev.expandedRunId,
       traces: prev.expandedRunId === runId ? [] : prev.traces
     }));
@@ -222,6 +227,7 @@ export function App(): React.JSX.Element {
     setState((prev) => ({ ...prev, expandedRunId: result.run.runId, page: "runs" }));
     await refreshAll();
     await loadTraces(result.run.runId);
+    await loadRunMetrics(result.run.runId);
     const followups = await window.autoagent.getFollowUpSuggestions({ runId: result.run.runId });
     setFollowUpActionsByRun((prev) => ({ ...prev, [result.run.runId]: followups }));
   }
@@ -241,6 +247,7 @@ export function App(): React.JSX.Element {
       setPlayObjective("");
       await refreshAll();
       await loadTraces(result.run.runId);
+      await loadRunMetrics(result.run.runId);
       const followups = await window.autoagent.getFollowUpSuggestions({ runId: result.run.runId });
       setFollowUpActionsByRun((prev) => ({ ...prev, [result.run.runId]: followups }));
     } catch (error) {

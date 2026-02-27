@@ -23,7 +23,7 @@ export function scoreExecution(input: EvalFeedbackInput): EvalFeedbackResult {
   const latencyScore = Math.max(0, 1 - input.latencyMs / input.maxLatencyMs);
   const costScore = Math.max(0, 1 - input.outputTokens / input.maxTokens);
   const safetyScore = input.safetyViolations === 0 ? 1 : Math.max(0, 1 - 0.25 * input.safetyViolations);
-  const aggregateScore = correctnessScore * 0.4 + latencyScore * 0.2 + costScore * 0.2 + safetyScore * 0.2;
+  const aggregateScore = correctnessScore * 0.5 + latencyScore * 0.1 + costScore * 0.2 + safetyScore * 0.2;
   return {
     correctnessScore,
     latencyScore,
